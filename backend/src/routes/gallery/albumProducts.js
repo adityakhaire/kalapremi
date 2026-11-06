@@ -1,0 +1,126 @@
+'use strict';
+const express = require('express'),
+  crypto = require('crypto');
+const { body, param, query } = require('express-validator');
+const {
+  verifyGalleryAccess,
+  denySlideshowToken,
+} = require('../../middleware/gallery');
+const { blockHiddenGallery } = require('../../utils/revealMode');
+const { requireFeatureFlag } = require('../../middleware/requireFeatureFlag');
+const { handleAsync, validateRequest } = require('../../utils/routeHelpers');
+const { ForbiddenError } = require('../../utils/errors');
+const images = require('../../services/albumProducts/images');
+const service = () =>
+  require('../../services/albumProducts/service').application();
+const customerContactsService = require('../../services/customerContactsService');
+
+const router = express.Router();
+// A portal session keeps its customer through a PIN role change; a plain PIN
+// session names nobody, which is what keeps it off a customer's offer.
+const viewerOf = (req) => ({
+  preview: !!req.isAdminPreview,
+  customerId: req.viaCustomer ? req.galleryAccess.session.customerId : null,
+});
+router.use(
+  '/:slug/album-products',
+  verifyGalleryAccess,
+  denySlideshowToken,
+  blockHiddenGallery,
+  requireFeatureFlag('albumProducts'),
+  (req, res, next) => {
+    res.set('Cache-Control', 'private, no-store');
+    if (req.accessLevel !== 'client' && !req.viaCustomer && !req.isAdminPreview)
+      return next(new ForbiddenError('Client access is required'));
+    next();
+  },
+);
+router.get(
+  '/:slug/album-products',
+  handleAsync(async (req, res) => {
+    const offers = await service().clientOffers(req.event.id, viewerOf(req));
+    const readOnly = !!req.viaCustomer
+      && !(await customerContactsService.sessionMayAct(req.galleryAccess?.session, 'galleries'));
+    res.json({ offers: offers.map((offer) => ({ ...offer, readOnly })) });
+  }),
+);
+router.get(
+  '/:slug/album-products/images/:imageId',
+  param('imageId').isUUID(),
+  query('size').optional().isIn(images.SIZES),
+  handleAsync(async (req, res) => {
+    validateRequest(req);
+    const image = await service().clientImage(req.event.id, req.params.imageId, viewerOf(req));
+    await images.sendImage(req, res, image, 'gallery album option image');
+  }),
+);
+router.put(
+  '/:slug/album-products/:id',
+  handleAsync(async (req, res, next) => {
+    // An album choice binds the customer: a view-only contact looks, not decides.
+    if (req.viaCustomer
+      && !(await customerContactsService.sessionMayAct(req.galleryAccess?.session, 'galleries'))) {
+      throw new ForbiddenError('Your login may not do this');
+    }
+    next();
+  }),
+  param('id').isUUID(),
+  body('revision').isInt({ min: 1 }),
+  body('mutationId').isUUID(),
+  body('modelId').optional().isUUID(),
+  body('colourId').optional().isUUID(),
+  body('values').optional().isObject(),
+  body('photoRoles').optional().isObject(),
+  body('productVersion').isHexadecimal().isLength({ min: 64, max: 64 }),
+  body('name').optional().isString().trim().isLength({ min: 1, max: 100 }),
+  body('submit').isBoolean(),
+  handleAsync(async (req, res) => {
+    validateRequest(req);
+    if (req.isAdminPreview)
+      throw new ForbiddenError('Admin preview cannot make a client choice');
+    // Record a digest of the authenticated session, never its bearer token.
+    const id = crypto
+      .createHash('sha256')
+      .update(
+        JSON.stringify({
+          event: req.event.id,
+          jti: req.galleryAccess?.session?.jti || null,
+          customer: req.galleryAccess?.session?.customerId || null,
+          issuedAt: req.galleryAccess?.session?.iat || null,
+          parent: req.galleryAccess?.session?.parentJti || null,
+        }),
+      )
+      .digest('hex');
+    res.json(
+      await service().mutate(
+        req.event,
+        {
+          id: req.params.id,
+          revision: req.body.revision,
+          mutationId: req.body.mutationId,
+          productVersion: req.body.productVersion,
+          values: req.body.values,
+          modelId: req.body.modelId,
+          colourId: req.body.colourId,
+          photoRoles: req.body.photoRoles,
+          submit: req.body.submit,
+        },
+        {
+          type: 'client',
+          id,
+          customerId: viewerOf(req).customerId,
+          name:
+            req.body.name === undefined
+              ? null
+              : require('../../services/albumProducts/validation').text(
+                req.body.name,
+                100,
+                true,
+              ),
+        },
+        { viewer: viewerOf(req) },
+      ),
+    );
+  }),
+);
+module.exports = router;

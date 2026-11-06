@@ -1,0 +1,538 @@
+const express = require('express');
+const pLimit = require('p-limit');
+const router = express.Router();
+const { db } = require('../database/db');
+const { adminAuth } = require('../middleware/auth');
+const { requirePermission, userHasAnyPermission } = require('../middleware/permissions');
+const { canAccessEvent } = require('../middleware/ownership');
+const { ensureThumbnail, ensurePreviewImage } = require('../services/imageProcessor');
+const { retryTransient } = require('../services/imageResourcePolicy');
+const { getStorage } = require('../services/storage');
+const logger = require('../utils/logger');
+const applicationWork = require('../services/activeApplicationWork');
+const loadGovernor = require('../services/loadGovernor');
+
+const { canonicalStorageKey, sameStorageKey } = require('../utils/storageKey');
+
+// Library-wide runs yield to guests on a busy server. Capped below the bulk
+// queues' pauses, and dropped once admission closes: a shutdown or restore drains
+// this work with the load probe stopped, so a held level would never clear.
+const MAX_REGENERATION_PAUSE_MS = 2000;
+function paceRegeneration() {
+  if (applicationWork.isClosed()) return undefined;
+  const pause = Math.min(loadGovernor.bulkDelayMs(), MAX_REGENERATION_PAUSE_MS);
+  return pause ? new Promise((resolve) => setTimeout(resolve, pause)) : undefined;
+}
+
+// One regeneration of each kind at a time. Two overlapping library-wide runs
+// double the load and delete each other's freshly written renditions. Held per
+// process; another replica can still start its own.
+const runningJobs = { thumbnails: false, previews: false };
+
+// Photos one preview regeneration works on at once. 1 (the default) is the old
+// one-by-one loop. Each photo spends most of its time fetching the original
+// from storage and writing the rendition back, so a few in flight keep the CPU
+// busy. Decodes stay in the isolated sharp pool (at most 2 workers), so the cap
+// bounds temp disk and storage connections, not RAM: a queued slot holds a temp
+// copy of the original and a storage request.
+// Several RAW files at once can fill the media staging budget, and the refusal
+// (MEDIA_QUEUE_FULL) asks for 5 s. This loop has no queue to put a photo back in,
+// so it waits here, holding its slot. Only that refusal: a stopped service would
+// hold the shutdown drain for every photo left, and a timeout would run as long
+// again.
+const PREVIEW_RETRY = { pauseMs: 5000, retryIf: (error) => error?.code === 'MEDIA_QUEUE_FULL' };
+
+function previewRegenConcurrency() {
+  const configured = Number.parseInt(process.env.PREVIEW_REGEN_CONCURRENCY || '1', 10);
+  return Number.isFinite(configured) && configured > 0 ? Math.min(configured, 8) : 1;
+}
+
+/**
+ * Who may start a regeneration. Scoped to an event it is that event's photo
+ * work, for whoever can act on the event. Unscoped it rebuilds every gallery
+ * after an instance-wide settings change, so it needs settings.edit like the
+ * settings write itself. Answers the refusal itself and returns false when
+ * the caller may not start the job.
+ */
+async function mayStartRegeneration(req, res, eventId) {
+  if (eventId) {
+    const event = await db('events').where('id', eventId).first();
+    if (!event) {
+      res.status(404).json({ error: 'Event not found' });
+      return false;
+    }
+    if (!canAccessEvent(req.admin, event)) {
+      res.status(403).json({ error: 'Access denied', code: 'FORBIDDEN' });
+      return false;
+    }
+    return true;
+  }
+  if (!(await userHasAnyPermission(req.admin.id, ['settings.edit']))) {
+    res.status(403).json({ error: 'Insufficient permissions', code: 'FORBIDDEN' });
+    return false;
+  }
+  return true;
+}
+
+// Parse JSON-encoded setting values
+function parseSettingValue(value) {
+  if (value === null || value === undefined) return null;
+  try { return JSON.parse(value); } catch (e) { return value; }
+}
+
+// Get thumbnail settings
+router.get('/settings', adminAuth, requirePermission('photos.view'), async (req, res) => {
+  try {
+    const settings = await db('app_settings')
+      .whereIn('setting_key', [
+        'thumbnail_width',
+        'thumbnail_height',
+        'thumbnail_fit',
+        'thumbnail_quality',
+        'thumbnail_format',
+        // Lightbox preview tier (#492). Boolean, default false.
+        'lightbox_preview_enabled'
+      ])
+      .select('setting_key', 'setting_value');
+
+    const settingsMap = {};
+    settings.forEach(s => {
+      const parsed = parseSettingValue(s.setting_value);
+      settingsMap[s.setting_key] = {
+        value: String(parsed ?? '')
+      };
+    });
+
+    res.json({
+      settings: settingsMap,
+      fitOptions: ['cover', 'contain', 'fill', 'inside', 'outside'],
+      formatOptions: ['jpeg', 'png', 'webp']
+    });
+  } catch (error) {
+    logger.error('Error fetching thumbnail settings:', error);
+    res.status(500).json({ error: 'Failed to fetch thumbnail settings' });
+  }
+});
+
+// Update thumbnail settings. Instance-wide: they shape every gallery's
+// renditions, so this is a settings edit like the other settings writes.
+router.put('/settings', adminAuth, requirePermission('settings.edit'), async (req, res) => {
+  try {
+    const { width, height, fit, quality, format, lightbox_preview_enabled } = req.body;
+    
+    // Validate inputs
+    if (width && (width < 50 || width > 1000)) {
+      return res.status(400).json({ error: 'Width must be between 50 and 1000 pixels' });
+    }
+    if (height && (height < 50 || height > 1000)) {
+      return res.status(400).json({ error: 'Height must be between 50 and 1000 pixels' });
+    }
+    if (quality && (quality < 1 || quality > 100)) {
+      return res.status(400).json({ error: 'Quality must be between 1 and 100' });
+    }
+    if (fit && !['cover', 'contain', 'fill', 'inside', 'outside'].includes(fit)) {
+      return res.status(400).json({ error: 'Invalid fit option' });
+    }
+    if (format && !['jpeg', 'png', 'webp'].includes(format)) {
+      return res.status(400).json({ error: 'Invalid format option' });
+    }
+    
+    // Update settings
+    const updates = [];
+    if (width) updates.push({ setting_key: 'thumbnail_width', setting_value: width });
+    if (height) updates.push({ setting_key: 'thumbnail_height', setting_value: height });
+    if (fit) updates.push({ setting_key: 'thumbnail_fit', setting_value: JSON.stringify(fit) });
+    if (quality) updates.push({ setting_key: 'thumbnail_quality', setting_value: quality });
+    if (format) updates.push({ setting_key: 'thumbnail_format', setting_value: JSON.stringify(format) });
+    // Lightbox preview tier (#492). Boolean — store JSON-stringified
+    // so the round-trip matches what migration 104 seeds.
+    if (typeof lightbox_preview_enabled === 'boolean') {
+      updates.push({
+        setting_key: 'lightbox_preview_enabled',
+        setting_value: JSON.stringify(lightbox_preview_enabled),
+      });
+    }
+
+    for (const update of updates) {
+      const updated = await db('app_settings')
+        .where('setting_key', update.setting_key)
+        .update({
+          setting_value: update.setting_value,
+          updated_at: db.fn.now()
+        });
+      // Defensive insert when the row is missing — covers the case
+      // where lightbox_preview_enabled is being saved on an install
+      // that pre-dates migration 104. Existing thumbnail_* keys are
+      // seeded by migration 040 so the update path always wins for
+      // them; this only fires on the new key.
+      if (!updated) {
+        await db('app_settings').insert({
+          setting_key: update.setting_key,
+          setting_value: update.setting_value,
+          setting_type: update.setting_key === 'lightbox_preview_enabled' ? 'thumbnail' : 'thumbnail',
+          updated_at: db.fn.now(),
+        });
+      }
+    }
+    
+    res.json({ 
+      message: 'Thumbnail settings updated successfully',
+      regenerateRequired: true 
+    });
+  } catch (error) {
+    logger.error('Error updating thumbnail settings:', error);
+    res.status(500).json({ error: 'Failed to update thumbnail settings' });
+  }
+});
+
+// Regenerate all thumbnails with new settings
+router.post('/regenerate', adminAuth, requirePermission('photos.edit'), async (req, res) => {
+  let acquired = false;
+  try {
+    const { eventId } = req.body; // Optional: regenerate for specific event only
+    if (!(await mayStartRegeneration(req, res, eventId))) return;
+    if (runningJobs.thumbnails) {
+      return res.status(409).json({ error: 'A thumbnail regeneration is already running.', code: 'REGENERATION_RUNNING' });
+    }
+    runningJobs.thumbnails = true;
+    acquired = true;
+    
+    // source_origin/external_relpath/filename feed BOTH deleteThumbnailTiers
+    // (which derives the tier keys from the same fields ensureThumbnailAtWidth
+    // wrote them with) and ensureThumbnail, which branches on them to resolve
+    // an external source off its mount instead of under events/active.
+    // thumbnail_path is selected so it can be nulled — see below.
+    let query = db('photos')
+      .select(
+        'id', 'event_id', 'path', 'media_type', 'mime_type', 'thumbnail_path',
+        // ensureThumbnail keeps a complete video's poster note in step with
+        // the frame it rebuilt (issue 1430); it needs the status to know.
+        'processing_status',
+        // An external row's tier keys carry its size and mtime; selected
+        // here so the helpers need not read them per photo.
+        'source_origin', 'external_relpath', 'filename', 'size_bytes', 'source_mtime_ms', 'source_filename',
+        // A RAW photo's tier keys are scoped by its processing attempt
+        // (imageProcessor's derivativeCacheId): without it the sweep derives
+        // other keys and the old tiers stay served (issue 2113).
+        'processing_attempt_id',
+        // A tier's key names the photo's focal point (issue 2377).
+        'focal_x', 'focal_y', 'focal_source'
+      );
+    if (eventId) {
+      query = query.where('event_id', eventId);
+    }
+    // Videos are included since ensureThumbnail learned to rebuild a poster
+    // frame (issue 1414) — they used to be filtered out here because Sharp
+    // threw on every one. They are handled differently in the loop below.
+
+    const photos = await query;
+    
+    if (photos.length === 0) {
+      runningJobs.thumbnails = false;
+      return res.json({ message: 'No photos to regenerate' });
+    }
+    
+    // Start regeneration in background
+    res.json({ 
+      message: `Started regenerating ${photos.length} thumbnails`,
+      count: photos.length 
+    });
+    
+    // Process thumbnails in background
+    applicationWork.defer('thumbnail regeneration', async () => {
+      let successCount = 0;
+      let errorCount = 0;
+      
+      for (const photo of photos) {
+        await paceRegeneration();
+        try {
+          // A video is REPAIRED, not rebuilt. Its poster frame is rendered at
+          // a fixed size by videoProcessor and does not depend on the settings
+          // this endpoint is pressed to apply, so forcing it would re-read
+          // every video on every press — a full object download each on S3 —
+          // to write back the same bytes. thumbnail_path stays on the row and
+          // `force` stays off, so ensureThumbnail's own validity check skips a
+          // healthy poster and only a missing or unreadable one is rebuilt.
+          // boundVideoSource:false because the size bound guards the guest
+          // request path; here an admin asked, in a background job, and
+          // bounded a large S3 video could only ever get the placeholder.
+          // No tier deletion either: videos never take the tier path.
+          const isVideo = photo.media_type === 'video' || (photo.mime_type && photo.mime_type.startsWith('video/'));
+          if (isVideo) {
+            if (await ensureThumbnail(photo, { boundVideoSource: false })) {
+              successCount++;
+            } else {
+              errorCount++;
+            }
+            continue;
+          }
+
+          // Drop the responsive tiers first (#1095), same as the preview
+          // endpoint below. They are cached by width outside thumbnail_path
+          // and their key carries no settings version, so regenerating only
+          // the canonical rendition leaves phones served the old fit, quality
+          // or format indefinitely — which is exactly what this endpoint is
+          // invoked to undo after a settings change.
+          //
+          // `strict`: a tier that could not be deleted keeps being served, so
+          // the photo counts as failed, not regenerated. The rebuild still
+          // runs; only the count changes.
+          const tierError = await require('../services/imageProcessor')
+            .deleteThumbnailTiers(photo, { strict: true }).then(() => null, (err) => err);
+
+          // Through ensureThumbnail, not a hand-rolled path (#1129). This
+          // route used to resolve the source as `storage/events/active/<path>`
+          // and fs.access it — a location that does not exist for external or
+          // reference rows, whose originals live under events.external_path.
+          // Every such photo failed the check and was counted as an error, so
+          // on a reference install the endpoint dropped every tier and
+          // rebuilt nothing, while the UI reported success (the response is
+          // sent before this loop starts).
+          //
+          // ensureThumbnail already resolves both source kinds via
+          // resolvePhotoFilePath/resolvePhotoStorageKey, uses the per-photo
+          // ext<id>_ output name so two events referencing one NAS basename
+          // cannot clobber each other, and writes thumbnail_path back itself.
+          // Nulling thumbnail_path is what stops it short-circuiting on
+          // isThumbnailValid — the same trick /regenerate-previews uses.
+          // `force` is what stops it joining a lazy generation that is still
+          // running under the OLD settings and adopting that result (#1020).
+          const newThumbnailPath = await ensureThumbnail({ ...photo, thumbnail_path: null }, { force: true });
+
+          if (newThumbnailPath) {
+            // Drop the superseded canonical rendition when the key MOVED.
+            //
+            // For a managed photo on S3, ensureThumbnail downloads the source
+            // to a randomly-named temp file, and for non-RAW input
+            // withProcessableImage passes no outputBasename — so the key is
+            // derived from that random name and differs on every run. Nulling
+            // thumbnail_path above hides the old key from everything that
+            // would otherwise clean it up, so without this each regeneration
+            // strands a full thumbnail in the bucket, once per photo per run.
+            //
+            // Guarded on the key actually changing: on local storage it is
+            // stable, and deleting the equal key would delete the file that
+            // was just written.
+            //
+            // And on no other row still pointing at it: watch-folder photos
+            // (stored under the camera's name, filename === source_filename)
+            // imported before their thumbnails got a per-photo name can share
+            // one key across galleries until the start-up repair separates
+            // them, and this photo moving off it must not blank the others.
+            // Uploads have generated names, so only those rows pay the lookup.
+            const moved = photo.thumbnail_path && !sameStorageKey(photo.thumbnail_path, newThumbnailPath);
+            const stillShared = moved && photo.filename === photo.source_filename
+              && await db('photos').where('thumbnail_path', photo.thumbnail_path).whereNot('id', photo.id).first('id');
+            if (moved && !stillShared) {
+              await getStorage().delete(photo.thumbnail_path).catch((err) => {
+                // Losing the old object is untidy, not a failed regeneration.
+                logger.warn(
+                  `Could not remove superseded thumbnail ${photo.thumbnail_path} for photo ${photo.id}: ${err.message}`
+                );
+              });
+            }
+            if (tierError) {
+              logger.error(`Regenerated thumbnail for photo ${photo.id}, but its old tiers remain: ${tierError.message}`);
+              errorCount++;
+            } else {
+              successCount++;
+              logger.info(`Regenerated thumbnail for photo ${photo.id}`);
+            }
+          } else {
+            errorCount++;
+          }
+        } catch (error) {
+          logger.error(`Error regenerating thumbnail for photo ${photo.id}:`, error);
+          errorCount++;
+        }
+      }
+      
+      runningJobs.thumbnails = false;
+      logger.info(`Thumbnail regeneration complete: ${successCount} success, ${errorCount} errors`);
+    });
+    
+  } catch (error) {
+    if (acquired) runningJobs.thumbnails = false;
+    logger.error('Error starting thumbnail regeneration:', error);
+    res.status(500).json({ error: 'Failed to start thumbnail regeneration' });
+  }
+});
+
+// Regenerate all preview-tier images (#492). Eager backfill counterpart
+// to ensurePreviewImage's lazy generation. Mirrors the regenerate
+// (thumbnails) endpoint above — same auth, same fire-and-forget shape,
+// same per-photo error handling.
+router.post('/regenerate-previews', adminAuth, requirePermission('photos.edit'), async (req, res) => {
+  let acquired = false;
+  try {
+    // onlyMissing: build the previews that do not exist yet and leave every
+    // existing one, and its tiers, alone. A run cut short by a restart, or
+    // repeated after new uploads, then picks up where it stopped instead of
+    // redoing the whole library.
+    const { eventId } = req.body;
+    const onlyMissing = req.body.onlyMissing === true;
+    if (!(await mayStartRegeneration(req, res, eventId))) return;
+    if (runningJobs.previews) {
+      return res.status(409).json({ error: 'A preview regeneration is already running.', code: 'REGENERATION_RUNNING' });
+    }
+    runningJobs.previews = true;
+    acquired = true;
+
+    // source_origin/external_relpath/filename are what ensurePreviewImage
+    // branches on for external/reference rows (#1078) — without them every
+    // external photo looks managed here and generation is skipped.
+    let query = db('photos').select(
+      'id', 'event_id', 'path', 'media_type', 'mime_type', 'preview_path',
+      'source_origin', 'external_relpath', 'filename', 'size_bytes', 'source_mtime_ms',
+      // RAW tier keys carry the processing attempt; see /regenerate.
+      'processing_attempt_id'
+    );
+    if (eventId) query = query.where('event_id', eventId);
+    // Skip videos — preview tier is image-only.
+    query = query.where(function() {
+      this.whereNull('media_type').orWhere('media_type', '!=', 'video');
+    });
+    if (onlyMissing) query = query.whereNull('preview_path');
+
+    const photos = await query;
+    if (photos.length === 0) {
+      runningJobs.previews = false;
+      return res.json({
+        message: onlyMissing ? 'No image photos are missing a preview' : 'No image photos to regenerate previews for',
+        count: 0,
+      });
+    }
+
+    res.json({
+      message: onlyMissing
+        ? `Started generating ${photos.length} missing previews`
+        : `Started regenerating ${photos.length} previews`,
+      count: photos.length,
+    });
+
+    applicationWork.defer('preview regeneration', async () => {
+      let successCount = 0;
+      let errorCount = 0;
+      // Previews this run replaced, removed after the loop (see below).
+      const superseded = [];
+      const limit = pLimit(previewRegenConcurrency());
+      await Promise.all(photos.map((photo) => limit(async () => {
+        await paceRegeneration();
+        try {
+          if (onlyMissing) {
+            // No preview to replace, so no tiers to drop and nothing
+            // superseded. Not forced: a lazy generation already running for
+            // this photo renders under the same settings, so joining it is
+            // the same result without doing the work twice.
+            if (await retryTransient(() => ensurePreviewImage(photo), PREVIEW_RETRY)) {
+              successCount++;
+            } else {
+              errorCount++;
+            }
+            return;
+          }
+          // Force regeneration regardless of existing preview state by
+          // nulling the cached path so ensurePreviewImage doesn't
+          // short-circuit on a stale isPreviewValid check.
+          // Drop the responsive tiers first (#1095). They are cached by width
+          // outside preview_path, so regenerating only the canonical rendition
+          // leaves phones served the stale 640/1280 copy indefinitely — which
+          // is precisely the case this endpoint exists for (a replaced
+          // reference source, or a corrupted rendition).
+          // `strict`: a tier left behind counts the photo as failed (see
+          // /regenerate); the rebuild still runs.
+          const tierError = await require('../services/imageProcessor')
+            .deletePreviewTiers(photo, { strict: true }).then(() => null, (err) => err);
+          // `force`: never adopt a lazy generation already in flight (#1020).
+          const newPreviewPath = await retryTransient(
+            () => ensurePreviewImage({ ...photo, preview_path: null }, { force: true }),
+            PREVIEW_RETRY
+          );
+          if (newPreviewPath) {
+            // The replaced preview, when the key MOVED. A camera-named
+            // (watch-folder) photo's preview is now named per photo, an S3
+            // source renders from a randomly-named temp copy, and an external
+            // row's name carries its source version: in each case the new key
+            // differs and the nulled preview_path hid the old one from every
+            // cleanup.
+            if (photo.preview_path && !sameStorageKey(photo.preview_path, newPreviewPath)) {
+              superseded.push({ id: photo.id, key: photo.preview_path });
+            }
+            if (tierError) {
+              logger.error(`Regenerated preview for photo ${photo.id}, but its old tiers remain: ${tierError.message}`);
+              errorCount++;
+            } else {
+              successCount++;
+            }
+          } else {
+            errorCount++;
+          }
+        } catch (error) {
+          logger.error(`Error regenerating preview for photo ${photo.id}:`, error);
+          errorCount++;
+        }
+      })));
+      // Delete the replaced previews no row points at any more, as the
+      // thumbnail endpoint does. One pass over every row's preview_path after
+      // the loop, not a lookup per photo (on S3 every key moves). A row that
+      // still holds a key keeps it, in whichever spelling it stores it:
+      // another photo (managed names derive from the source basename), or
+      // this one, when an older render on another replica published that key
+      // again. Trashed rows count; they are restorable.
+      if (superseded.length) {
+        try {
+          const referenced = new Set();
+          let lastId = 0;
+          for (;;) {
+            const rows = await db('photos').whereNotNull('preview_path').where('id', '>', lastId)
+              .orderBy('id').limit(1000).select('id', 'preview_path');
+            if (!rows.length) break;
+            for (const row of rows) referenced.add(canonicalStorageKey(row.preview_path));
+            lastId = rows[rows.length - 1].id;
+          }
+          for (const { id, key } of superseded) {
+            if (referenced.has(canonicalStorageKey(key))) continue;
+            // Two photos of this run may have shared it: one delete.
+            referenced.add(canonicalStorageKey(key));
+            await getStorage().delete(key).catch((err) => {
+              // Losing the old object is untidy, not a failed regeneration.
+              logger.warn(`Could not remove superseded preview ${key} for photo ${id}: ${err.message}`);
+            });
+          }
+        } catch (err) {
+          logger.warn(`Could not check which superseded previews are still in use; keeping them: ${err.message}`);
+        }
+      }
+      runningJobs.previews = false;
+      logger.info(`Preview regeneration complete: ${successCount} success, ${errorCount} errors`);
+    });
+  } catch (error) {
+    if (acquired) runningJobs.previews = false;
+    logger.error('Error starting preview regeneration:', error);
+    res.status(500).json({ error: 'Failed to start preview regeneration' });
+  }
+});
+
+// Get regeneration status
+router.get('/regenerate/status', adminAuth, requirePermission('photos.view'), async (req, res) => {
+  try {
+    // Count photos with and without thumbnails
+    const totalPhotos = await db('photos').count('id as count').first();
+    const photosWithThumbnails = await db('photos')
+      .whereNotNull('thumbnail_path')
+      .count('id as count')
+      .first();
+    
+    res.json({
+      total: totalPhotos.count,
+      withThumbnails: photosWithThumbnails.count,
+      withoutThumbnails: totalPhotos.count - photosWithThumbnails.count,
+      percentage: Math.round((photosWithThumbnails.count / totalPhotos.count) * 100)
+    });
+  } catch (error) {
+    logger.error('Error fetching regeneration status:', error);
+    res.status(500).json({ error: 'Failed to fetch regeneration status' });
+  }
+});
+
+module.exports = router;

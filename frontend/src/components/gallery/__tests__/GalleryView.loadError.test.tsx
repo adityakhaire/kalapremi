@@ -1,0 +1,173 @@
+/**
+ * What the gallery does when /photos fails after photos have loaded. A
+ * transient failure on a background refetch keeps the grid on screen; a
+ * gallery that has expired, been deleted or closed to this guest (403, 404,
+ * 410) replaces the grid, as it did before the styling overhaul, instead of
+ * leaving thumbnails that then fail one by one.
+ */
+import React from 'react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+
+type PhotosResult = { data: unknown; isLoading: boolean; error: unknown; refetch: () => void };
+let photos: PhotosResult;
+
+// Hooks hand back the same objects on every render, as the real ones do;
+// fresh ones each time would re-run the view's effects without end.
+const stable = vi.hoisted(() => ({
+  auth: { logout: vi.fn(), endSession: vi.fn(), isClient: false, viaCustomer: false },
+  theme: { setTheme: () => {}, theme: {} },
+  download: { mutate: () => {}, isPending: false },
+  settings: { data: {} },
+  watermark: { watermarkEnabled: false },
+  t: (key: string) => key,
+  modalMounts: vi.fn(), modalUnmounts: vi.fn(),
+}));
+
+vi.mock('../../../contexts', () => ({
+  useGalleryAuth: () => stable.auth,
+  useTheme: () => stable.theme,
+}));
+
+vi.mock('../../../hooks/useGallery', () => ({
+  useGalleryPhotos: () => photos,
+  useDownloadAllPhotos: () => stable.download,
+}));
+
+vi.mock('../../../hooks/usePublicSettings', () => ({ usePublicSettings: () => stable.settings }));
+vi.mock('../../../hooks/useWatermarkSettings', () => ({ useWatermarkSettings: () => stable.watermark }));
+vi.mock('../../../hooks/useGalleryCustomCss', () => ({ useGalleryCustomCss: () => undefined }));
+vi.mock('../../../hooks/useDevToolsProtection', () => ({ useDevToolsProtection: () => undefined }));
+
+vi.mock('react-i18next', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('react-i18next')>()),
+  useTranslation: () => ({ t: stable.t, i18n: { language: 'en' } }),
+}));
+
+vi.mock('../../../services/analytics.service', () => ({
+  analyticsService: { track: vi.fn(), trackGalleryEvent: vi.fn(), trackSearch: vi.fn(), trackExpirationWarning: vi.fn() },
+}));
+vi.mock('../../../services/gallery.service', () => ({
+  galleryService: { getPeople: vi.fn().mockResolvedValue({ people: [] }), startDownloadJob: vi.fn().mockResolvedValue({ token: 'job', status: 'pending' }) },
+}));
+vi.mock('../../../services/feedback.service', () => ({
+  feedbackService: {
+    getGalleryFeedbackSettings: vi.fn().mockResolvedValue({ feedback_enabled: false }),
+    getMyFeedback: vi.fn().mockResolvedValue({}),
+  },
+}));
+
+vi.mock('../GalleryLayout', () => ({
+  GalleryLayout: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
+}));
+vi.mock('../DownloadResolutionModal', () => ({
+  DownloadResolutionModal: () => {
+    React.useEffect(() => { stable.modalMounts(); return () => { stable.modalUnmounts(); }; }, []);
+    return <div role="dialog">Preparing archive</div>;
+  },
+}));
+vi.mock('../PhotoGridWithLayouts', () => ({
+  PhotoGridWithLayouts: () => <StartArchive />,
+}));
+
+import { useArchiveDownload } from '../../../contexts/ArchiveDownloadContext';
+function StartArchive() {
+  const archives = useArchiveDownload();
+  return <div data-testid="photo-grid"><button onClick={() => void archives.downloadAllPhotos('wedding')}>Prepare archive</button></div>;
+}
+
+import { GalleryView } from '../GalleryView';
+
+const event = {
+  id: 1,
+  event_name: 'Hoa Wedding',
+  event_type: 'wedding',
+  event_date: '2026-09-19',
+  expires_at: '2027-09-19T00:00:00Z',
+};
+
+const loaded = {
+  event: { ...event },
+  categories: [],
+  photos: [{ id: 7, filename: 'a.jpg', url: '/a.jpg', thumbnail_url: '/a-t.jpg', type: 'photo', size: 1, uploaded_at: '2026-09-19T10:00:00Z' }],
+};
+
+function show(error: unknown) {
+  photos = { data: loaded, isLoading: false, error, refetch: vi.fn() };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  render(
+    <QueryClientProvider client={client}>
+      <GalleryView slug="wedding" event={event} />
+    </QueryClientProvider>,
+  );
+}
+
+const httpError = (status: number) => Object.assign(new Error(`HTTP ${status}`), { response: { status } });
+
+afterEach(() => { cleanup(); stable.theme.theme = {}; });
+
+describe('GalleryView after a failed refetch', () => {
+  it('replaces already loaded photos with a friendly message when disabled without ending the session', () => {
+    show({ response: { status: 403, data: { code: 'GALLERY_TEMPORARILY_DISABLED' } } });
+    expect(screen.getByText('gallery.temporarilyUnavailable')).toBeInTheDocument();
+    expect(screen.queryByTestId('photo-grid')).not.toBeInTheDocument();
+    expect(stable.auth.endSession).not.toHaveBeenCalled();
+  });
+  it.each([403, 404, 410])('replaces the grid when the gallery is gone (%i)', (status) => {
+    show(httpError(status));
+    expect(screen.getByText('gallery.failedToLoad')).toBeInTheDocument();
+    expect(screen.queryByTestId('photo-grid')).toBeNull();
+  });
+
+  // Issue 2209: a rejected session is not the visitor leaving the device, so
+  // it must not take the guest identity with it the way logout() does.
+  it('ends a rejected session (401) without logging the guest out', () => {
+    stable.auth.logout.mockClear();
+    stable.auth.endSession.mockClear();
+    show(httpError(401));
+    expect(stable.auth.endSession).toHaveBeenCalled();
+    expect(stable.auth.logout).not.toHaveBeenCalled();
+  });
+
+  it('keeps the grid on a transient failure (500)', () => {
+    show(httpError(500));
+    expect(screen.getByTestId('photo-grid')).toBeInTheDocument();
+    expect(screen.queryByText('gallery.failedToLoad')).toBeNull();
+  });
+});
+
+it.each(['gone', 'paused'])('keeps one archive dialog across content/layout changes and cancels it when the gallery is %s', async (state) => {
+  stable.modalMounts.mockClear(); stable.modalUnmounts.mockClear();
+  photos = { data: loaded, isLoading: false, error: null, refetch: vi.fn() };
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const tree = () => <QueryClientProvider client={client}><GalleryView slug="wedding" event={event} /></QueryClientProvider>;
+  const { rerender } = render(tree());
+  fireEvent.click(screen.getByRole('button', { name: 'Prepare archive' }));
+  expect(await screen.findByRole('dialog')).toBeInTheDocument();
+  expect(stable.modalMounts).toHaveBeenCalledTimes(1);
+  stable.theme.theme = { galleryLayout: 'gallery-premium' };
+  rerender(tree());
+  expect(screen.getByRole('dialog')).toBeInTheDocument();
+  expect(stable.modalMounts).toHaveBeenCalledTimes(1);
+  stable.theme.theme = { galleryLayout: 'gallery-story' };
+  rerender(tree());
+  expect(stable.modalMounts).toHaveBeenCalledTimes(1);
+  photos = { ...photos, error: httpError(500) };
+  rerender(tree());
+  expect(screen.getByRole('dialog')).toBeInTheDocument();
+  expect(stable.modalMounts).toHaveBeenCalledTimes(1);
+  photos = { ...photos, error: state === 'paused'
+    ? { response: { status: 403, data: { code: 'GALLERY_TEMPORARILY_DISABLED' } } } : httpError(403) };
+  rerender(tree());
+  expect(screen.getByText(state === 'paused' ? 'gallery.temporarilyUnavailable' : 'gallery.failedToLoad')).toBeInTheDocument();
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(stable.modalUnmounts).toHaveBeenCalledTimes(1);
+  photos = { ...photos, data: undefined, error: null, isLoading: true };
+  rerender(tree());
+  photos = { data: loaded, error: null, isLoading: false, refetch: vi.fn() };
+  rerender(tree());
+  fireEvent.click(screen.getByRole('button', { name: 'Prepare archive' }));
+  expect(await screen.findByRole('dialog')).toBeInTheDocument();
+  expect(stable.modalMounts).toHaveBeenCalledTimes(2);
+});

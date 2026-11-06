@@ -1,0 +1,74 @@
+/**
+ * Client-activity notification types (#746): gallery_opened /
+ * gallery_downloaded (new logActivity calls in gallery.js) and
+ * photo_favorite (logged by feedbackService since #400-era) must resolve
+ * through the smart camelCase fallback in formatNotificationMessage —
+ * i.e. the locale keys must exist, otherwise the bell renders the generic
+ * "system activity" line.
+ */
+import { describe, it, expect } from 'vitest';
+import i18n from '../../i18n/config';
+import { notificationsService, type Notification } from '../notifications.service';
+
+const base: Omit<Notification, 'type'> = {
+  id: 1,
+  actorType: 'guest',
+  actorName: null,
+  eventName: 'Anna & Tom',
+  eventId: 42,
+  metadata: {},
+  createdAt: '2026-07-19T12:00:00Z',
+  readAt: null,
+  isRead: false,
+} as any;
+
+describe('client-activity notifications (#746)', () => {
+  it.each(['en', 'de'])('identifies a print order and invoice after gallery deletion (%s)', async (language) => {
+    const previousLanguage = i18n.language;
+    try {
+      await i18n.changeLanguage(language);
+      const message = notificationsService.formatNotificationMessage({
+        ...base, type: 'print_order_accepted', eventName: null,
+        metadata: { orderId: '12345678-1234-4123-8123-123456789abc', invoiceId: 19, eventName: 'Anna & Tom' },
+      } as Notification);
+      expect(message).toContain('Anna & Tom');
+      expect(message).toContain('12345678');
+      expect(message).toContain('#19');
+      expect(message).not.toContain('{{');
+      expect(message).not.toContain('printSales.');
+    } finally {
+      await i18n.changeLanguage(previousLanguage);
+    }
+  });
+
+  it.each(['en', 'de'])('explains the PIN-entry security pause in the bell and feed (%s)', async (language) => {
+    await i18n.changeLanguage(language);
+    const msg = notificationsService.formatNotificationMessage({ ...base, type: 'gallery_pin_entry_paused' } as Notification);
+    expect(msg).toContain('Anna & Tom');
+    expect(msg).toMatch(/Private client links|Private Kundenlinks/);
+    expect(msg).not.toContain('{{');
+    expect(notificationsService.getNotificationStyle('gallery_pin_entry_paused').icon).toBe('Shield');
+    const feed = i18n.t('admin.activities.gallery_pin_entry_paused', { eventName: 'Anna & Tom' });
+    expect(feed).toContain('Anna & Tom');
+    expect(feed).not.toContain('{{');
+  });
+
+  it.each(['gallery_opened', 'gallery_downloaded', 'photo_favorite'])(
+    'formats %s via a real locale key (no generic fallback)',
+    async (type) => {
+      await i18n.changeLanguage('en');
+      const msg = notificationsService.formatNotificationMessage({ ...base, type } as Notification);
+      expect(msg).toContain('Anna & Tom');
+      expect(msg.toLowerCase()).not.toContain('system activity');
+    }
+  );
+
+  it('has a distinct style for each new type', () => {
+    const opened = notificationsService.getNotificationStyle('gallery_opened');
+    const downloaded = notificationsService.getNotificationStyle('gallery_downloaded');
+    const favorite = notificationsService.getNotificationStyle('photo_favorite');
+    expect(opened.icon).toBe('Eye');
+    expect(downloaded.icon).toBe('Download');
+    expect(favorite.icon).toBe('Heart');
+  });
+});

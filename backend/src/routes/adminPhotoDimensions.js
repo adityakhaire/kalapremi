@@ -1,0 +1,1379 @@
+const express = require('express');
+const router = express.Router();
+const { db } = require('../database/db');
+const { adminAuth } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/permissions');
+const fs = require('fs').promises;
+const logger = require('../utils/logger');
+const applicationWork = require('../services/activeApplicationWork');
+
+const { resolvePhotoFilePath } = require('../services/photoResolver');
+const maintenanceJobs = require('../services/maintenanceJobState');
+
+// Run state for both sweeps lives in the database, not in this process
+// (#1181). It used to be a module-level object per job, which is correct on a
+// single replica and wrong behind a load balancer: the status poll answers
+// from whichever process it reaches, so an idle replica reports isRunning
+// false while another is mid-run, the UI re-enables the button, and the next
+// POST starts a duplicate pass over the entire library.
+//
+// Two separate rows, for the same reason the two objects were separate: the
+// jobs walk the same photos but read different things out of them, and one
+// running must not block or report for the other.
+const { JOB_DIMENSION_REPAIR, JOB_CAPTURE_DATE_BACKFILL, JOB_ORIENTATION_BACKFILL, JOB_CREDIT_BACKFILL, JOB_THUMB_HASH_BACKFILL } = maintenanceJobs;
+
+const { startLeaseKeeper } = maintenanceJobs;
+
+// Repair photo dimensions (background job)
+//
+// system.manage, not photos.edit: the query below is unscoped, so this walks
+// every event in the install, reads every original off S3 or the NAS mount, and
+// rewrites their metadata. photos.edit is held by the team_photographer preset
+// (175_granular_permissions_and_presets.js:106), which exists for a contributing
+// second shooter — someone who should be able to edit the photos they work on,
+// not start a whole-library scan or touch another owner's events.
+router.post('/repair-dimensions', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    // Claimed before the candidate query, not after: that query is an await,
+    // and two requests arriving inside it would both read "not running" and
+    // both start a pass. The claim is a conditional UPDATE, so it settles the
+    // race across replicas as well as within one.
+    const token = await maintenanceJobs.claim(JOB_DIMENSION_REPAIR);
+    if (!token) {
+      return res.status(409).json({ error: 'Repair is already running' });
+    }
+    // Started at the claim, not at the loop: on a large or loaded install the
+    // candidate SELECT below (plus the setImmediate hop) can itself outlast the
+    // stale window, and an unrenewed claim would be taken over before the sweep
+    // had read its first photo. Handed to the background section, which stops
+    // it; every early exit here stops it too.
+    const lease = startLeaseKeeper(JOB_DIMENSION_REPAIR, token);
+
+    let photos;
+    try {
+      photos = await db('photos')
+        .join('events', 'photos.event_id', 'events.id')
+        .where(function () {
+          this.whereNull('photos.width').orWhereNull('photos.height');
+        })
+        .where(function () {
+          this.where('photos.media_type', '!=', 'video').orWhereNull('photos.media_type');
+        })
+        .select(
+          'photos.id', 'photos.path', 'photos.filename',
+          'photos.source_origin', 'photos.external_relpath', 'photos.event_id',
+          'events.source_mode', 'events.external_path', 'events.slug'
+        );
+    } catch (err) {
+      lease.stop();
+      await maintenanceJobs.release(JOB_DIMENSION_REPAIR, token);
+      throw err;
+    }
+
+    if (photos.length === 0) {
+      // Released with no result: nothing ran, so the numbers from the last
+      // real run stay on screen rather than being blanked by a no-op.
+      lease.stop();
+      await maintenanceJobs.release(JOB_DIMENSION_REPAIR, token);
+      return res.json({ message: 'No photos need dimension repair', count: 0 });
+    }
+
+    // Return immediately
+    res.json({
+      message: `Started repairing dimensions for ${photos.length} photos`,
+      count: photos.length
+    });
+
+    // Process in background
+    applicationWork.defer('dimension repair', async () => {
+      let sharp;
+      try {
+        sharp = require('../services/isolatedSharp');
+      } catch (err) {
+        logger.error('Sharp not available for dimension repair:', err.message);
+        lease.stop();
+        await maintenanceJobs.release(JOB_DIMENSION_REPAIR, token, { success: 0, failed: 0, error: 'Sharp not available' });
+        return;
+      }
+
+      let successCount = 0;
+      let errorCount = 0;
+      let lostClaim = false;
+
+      // Everything below runs detached from the request, so an unexpected
+      // throw has nobody to report to. Without this the claim would sit held
+      // until it aged out of the staleness window, disabling the button for
+      // that whole time on every replica.
+      try {
+        for (const photo of photos) {
+          // The timer does the renewing; this only notices that it has
+          // already failed, so the loop stops instead of running on beside the
+          // replica that took the claim over.
+          if (lease.lost()) { lostClaim = true; break; }
+
+          try {
+            const event = { source_mode: photo.source_mode, external_path: photo.external_path, slug: photo.slug };
+            let fullPath;
+            try {
+              fullPath = resolvePhotoFilePath(event, photo);
+            } catch (err) {
+              logger.warn(`Photo ${photo.id} has no resolvable path, skipping dimension repair: ${err.message}`);
+              errorCount++;
+              continue;
+            }
+
+            try {
+              await fs.access(fullPath);
+            } catch (err) {
+              logger.warn(`File not found for photo ${photo.id}: ${fullPath}`);
+              errorCount++;
+              continue;
+            }
+
+            const metadata = await sharp(fullPath).metadata();
+            // Oriented, not raw — see orientedDimensions (#1185).
+            const dims = require('../services/imageProcessor').orientedDimensions(metadata);
+
+            if (dims.width && dims.height) {
+              await db('photos')
+                .where({ id: photo.id })
+                .update({
+                  width: dims.width,
+                  height: dims.height
+                });
+              successCount++;
+
+              if (successCount % 50 === 0) {
+                logger.info(`Dimension repair progress: ${successCount} updated...`);
+              }
+            } else {
+              logger.warn(`Could not extract dimensions for photo ${photo.id}`);
+              errorCount++;
+            }
+          } catch (error) {
+            logger.error(`Error repairing dimensions for photo ${photo.id}:`, error);
+            errorCount++;
+          }
+        }
+
+        if (lostClaim) {
+          // Another replica declared this run stale and took it over. It owns
+          // the row now, so releasing would clear ITS flag — release() refuses
+          // on the token, but there is nothing to report either way.
+          logger.warn(`Dimension repair stopped: claim taken over after ${successCount} updated, ${errorCount} errors`);
+          return;
+        }
+        await maintenanceJobs.release(JOB_DIMENSION_REPAIR, token, { success: successCount, failed: errorCount });
+        logger.info(`Dimension repair complete: ${successCount} success, ${errorCount} errors`);
+      } catch (err) {
+        logger.error('Dimension repair aborted:', err);
+        await maintenanceJobs
+          .release(JOB_DIMENSION_REPAIR, token, { success: successCount, failed: errorCount, error: err.message })
+          .catch(() => {});
+      } finally {
+        lease.stop();
+      }
+    });
+  } catch (error) {
+    logger.error('Error starting dimension repair:', error);
+    res.status(500).json({ error: 'Failed to start dimension repair' });
+  }
+});
+
+// Get dimension repair status
+//
+// The same permission as the POST, not the read-only system.view. The two are
+// independent grants, and StatusTab has no permission gate of its own — a
+// successful status payload is what renders the card and its enabled button
+// (StatusTab.tsx:558). system.view alone would therefore show a live Repair
+// button whose every click 403s with no error surfaced.
+router.get('/repair-dimensions/status', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    const totalPhotos = await db('photos')
+      .where(function () {
+        this.where('media_type', '!=', 'video').orWhereNull('media_type');
+      })
+      .count('id as count')
+      .first();
+
+    const withDimensions = await db('photos')
+      .where(function () {
+        this.where('media_type', '!=', 'video').orWhereNull('media_type');
+      })
+      .whereNotNull('width')
+      .whereNotNull('height')
+      .count('id as count')
+      .first();
+
+    const total = Number(totalPhotos.count);
+    const withDims = Number(withDimensions.count);
+    // Read from the shared row, so this answers the same on every replica.
+    const state = await maintenanceJobs.read(JOB_DIMENSION_REPAIR);
+
+    res.json({
+      total,
+      withDimensions: withDims,
+      withoutDimensions: total - withDims,
+      isRunning: state.isRunning,
+      lastResult: state.lastResult
+    });
+  } catch (error) {
+    logger.error('Error fetching dimension repair status:', error);
+    res.status(500).json({ error: 'Failed to fetch dimension repair status' });
+  }
+});
+
+/**
+ * Backfill captured_at from EXIF (#1172).
+ *
+ * External imports never read EXIF before this release, so every
+ * externally-imported photo carries captured_at NULL — and the gallery's
+ * "Date Taken" sort falls back to uploaded_at, which on a bulk import is the
+ * import timestamp. A 5555-photo trip came back ordered by which folder was
+ * imported first.
+ *
+ * Deliberately an endpoint rather than a migration: the originals live on a
+ * mount that may be unavailable at upgrade time, reading 8000+ of them blocks
+ * the boot, and a run that found nothing needs to be repeatable once the mount
+ * is back. Same reasoning, and the same shape, as the dimension repair above —
+ * including resolvePhotoFilePath, which is what makes it work for external
+ * rows at all (the thumbnail regenerator resolves under
+ * storage/events/active/<path>, which never exists for them).
+ */
+// system.manage, not photos.edit: this walks every event in the install and
+// rewrites their metadata. photos.edit is held by the team_photographer preset
+// (175_granular_permissions_and_presets.js:106), which exists precisely for a
+// contributing shooter who should not be able to start a whole-library S3/NAS
+// scan or touch another owner's photos. The dimension repair above had the same
+// exposure and predates this; it is brought in line separately in #1182.
+router.post('/repair-capture-dates', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    // Claimed here, not after the candidate query: that query is an await, and
+    // two POSTs arriving inside it would both read "not running" and both start
+    // a pass over the same rows. Being a conditional UPDATE, the claim settles
+    // that between replicas too. Every early exit below has to release it
+    // again, hence the try/catch around the query.
+    const token = await maintenanceJobs.claim(JOB_CAPTURE_DATE_BACKFILL);
+    if (!token) {
+      return res.status(409).json({ error: 'Capture date backfill is already running' });
+    }
+    // Started at the claim so the candidate SELECT below is covered too — see
+    // the dimension repair above.
+    const lease = startLeaseKeeper(JOB_CAPTURE_DATE_BACKFILL, token);
+
+    let photos;
+    try {
+      photos = await db('photos')
+        .join('events', 'photos.event_id', 'events.id')
+        // Also every photo whose camera details were never read (issue 1733,
+        // D1). exif_json is written even when a file carries none ('{}'), so
+        // a photo is read for them once and never again.
+        // And every photo whose camera clock was never read (issue 2305):
+        // '' marks a file read without one, so it is not read again.
+        .where(function () {
+          this.whereNull('photos.captured_at').orWhereNull('photos.exif_json')
+            .orWhereNull('photos.captured_at_wall');
+        })
+        // Three markers, because no single one is reliable. fileWatcher's
+        // auto-import sets type='video' and a video/* mime but never
+        // media_type (fileWatcher.js:128-130), so those rows keep the 'image'
+        // default from migration 048 and a media_type-only filter queues them
+        // forever: extractCaptureDate returns null for a video, captured_at
+        // stays null, and every run picks it up again.
+        .where(function () {
+          this.where('photos.media_type', '!=', 'video').orWhereNull('photos.media_type');
+        })
+        .where(function () {
+          this.where('photos.type', '!=', 'video').orWhereNull('photos.type');
+        })
+        .where(function () {
+          this.whereNull('photos.mime_type').orWhere('photos.mime_type', 'not like', 'video/%');
+        })
+        // Archiving deletes the originals from storage but keeps the photos
+        // rows (archiveService.js:166,199). Those files are inside the zip and
+        // nothing here can read them, so including them would fail every row
+        // on every run and leave the button permanently lit.
+        .where(function () {
+          this.where('events.is_archived', false).orWhereNull('events.is_archived');
+        })
+        .select(
+          'photos.id', 'photos.path', 'photos.filename',
+          'photos.source_origin', 'photos.external_relpath', 'photos.event_id',
+          'photos.captured_at', 'photos.exif_json', 'photos.captured_at_wall',
+          'events.source_mode', 'events.external_path', 'events.slug'
+        );
+    } catch (err) {
+      lease.stop();
+      await maintenanceJobs.release(JOB_CAPTURE_DATE_BACKFILL, token);
+      throw err;
+    }
+
+    if (photos.length === 0) {
+      // No result passed: nothing ran, so the last real run's numbers survive.
+      lease.stop();
+      await maintenanceJobs.release(JOB_CAPTURE_DATE_BACKFILL, token);
+      return res.json({ message: 'No photos need a capture date', count: 0 });
+    }
+
+    res.json({
+      message: `Started backfilling capture dates for ${photos.length} photos`,
+      count: photos.length
+    });
+
+    applicationWork.defer('dimension repair', async () => {
+      const { extractCapture, withLocalCopy } = require('../services/imageProcessor');
+      const { extractPhotoExif } = require('../services/photoExif');
+      const { resolvePhotoStorageKey } = require('../services/photoResolver');
+      let exifCount = 0;
+      let wallCount = 0;
+      let successCount = 0;
+      let missingCount = 0;
+      let errorCount = 0;
+      let skippedCount = 0;
+      let lostClaim = false;
+
+      // Same reasoning as the dimension repair: detached from the request, so
+      // an unexpected throw must not leave the claim held.
+      try {
+        for (const photo of photos) {
+          // The timer renews; this only notices it has already failed.
+          if (lease.lost()) { lostClaim = true; break; }
+
+          try {
+            const event = { source_mode: photo.source_mode, external_path: photo.external_path, slug: photo.slug };
+            const isExternal = photo.source_origin === 'external' || photo.source_origin === 'reference';
+
+            // Two source shapes, same split the thumbnail regenerator uses
+            // (imageProcessor.js:391-420). External rows live on a local mount
+            // and are read directly; managed rows live behind the storage
+            // backend, which on an S3 install is not a filesystem at all — going
+            // through resolvePhotoFilePath there would build a STORAGE_PATH that
+            // holds nothing and fail every managed photo.
+            // One open of the original serves both reads; each is skipped
+            // when the row already has its value.
+            const needsDate = !photo.captured_at;
+            const needsWall = photo.captured_at_wall == null;
+            const readFile = async (localPath) => ({
+              capture: needsDate || needsWall ? await extractCapture(localPath) : null,
+              exif: photo.exif_json ? null : await extractPhotoExif(localPath),
+            });
+            let capture;
+            let exif;
+            if (isExternal) {
+              let fullPath;
+              try {
+                fullPath = resolvePhotoFilePath(event, photo);
+              } catch (err) {
+                logger.warn(`Photo ${photo.id} has no resolvable path, skipping capture date: ${err.message}`);
+                errorCount++;
+                continue;
+              }
+
+              try {
+                await fs.access(fullPath);
+              } catch (err) {
+                logger.warn(`File not found for photo ${photo.id}: ${fullPath}`);
+                errorCount++;
+                continue;
+              }
+
+              ({ capture, exif } = await readFile(fullPath));
+            } else {
+              let sourceKey;
+              try {
+                sourceKey = resolvePhotoStorageKey(event, photo);
+              } catch (err) {
+                logger.warn(`Photo ${photo.id} has no resolvable storage key, skipping capture date: ${err.message}`);
+                errorCount++;
+                continue;
+              }
+
+              // In local-fs mode withLocalCopy hands back the resolved path
+              // without checking it exists, so the access probe stays. In S3
+              // mode a missing object throws out of getToFile and lands in the
+              // outer catch — both end up counted as failures, which is what a
+              // missing original is.
+              ({ capture, exif } = await withLocalCopy(sourceKey, async (localPath) => {
+                await fs.access(localPath);
+                return readFile(localPath);
+              }));
+            }
+
+            // Same fence as the date below, and whereNull for the same
+            // reason. A null read (the file could not be read) writes nothing
+            // and stays for the next run.
+            if (exif) {
+              exifCount += await db('photos')
+                .where({ id: photo.id, path: photo.path, filename: photo.filename })
+                .whereNull('exif_json')
+                .update({ exif_json: JSON.stringify(exif) });
+            }
+
+            // The camera clock of a photo that already has its date (issue
+            // 2305), same fence; '' when the file carries none. A null
+            // capture (the file could not be read) writes nothing. A photo
+            // still without a date gets it with the date below.
+            if (!needsDate && needsWall && capture) {
+              wallCount += await db('photos')
+                .where({ id: photo.id, path: photo.path, filename: photo.filename })
+                .whereNull('captured_at_wall')
+                .update({ captured_at_wall: capture.wall || '' });
+            }
+
+            // The counters below are about capture dates; a photo that was
+            // only missing its camera details is done here.
+            if (!needsDate) continue;
+            const captured = capture ? capture.capturedAt : null;
+
+            if (!captured) {
+            // No date recovered. Usually genuine — plenty of sources carry no
+            // EXIF — but extractCaptureDate also returns null when the file is
+            // unreadable as an image, so this bucket is "nothing to write",
+            // not "definitely has no EXIF". The failure counter above is the
+            // one that means the storage is broken.
+              missingCount++;
+              continue;
+            }
+
+            // whereNull, not a blanket set: the job can run for a long time on a
+            // large library, and an import or a replacement finishing meanwhile
+            // has already written a date this pass would otherwise overwrite
+            // with the same-or-worse value.
+            //
+            // Fenced on path and filename as well as the id, for the same reason
+            // the orientation backfill below is (#1199): replacePhoto — reachable
+            // from the replace_by_name upload path (adminPhotos.js) — swaps a NEW
+            // file under an existing row and rewrites path/filename. That
+            // replacement carries no date of its own, so captured_at is still
+            // NULL and whereNull alone would let the previous file's EXIF date
+            // land on it. Matching the identity that was actually read means the
+            // update affects no rows and the row is simply skipped.
+            const updated = await db('photos')
+              .where({ id: photo.id, path: photo.path, filename: photo.filename })
+              .whereNull('captured_at')
+              .update({ captured_at: captured.toISOString(), captured_at_wall: capture.wall || '' });
+            // Counted, not dropped: without this a candidate that was read but
+            // not written falls out of the run's arithmetic entirely, and
+            // success + noExif + failed silently stops adding up to the count
+            // the operator was shown when they started it. Two ways to land
+            // here, both "another writer got there first" — the row was dated
+            // meanwhile (whereNull), or its file changed under us (the fence).
+            // Neither is an error and neither needs a retry: captured_at is
+            // still NULL for the fenced case, so the status endpoint keeps
+            // reporting it as backlog and the next run picks it up.
+            if (updated) successCount++; else skippedCount++;
+
+            if (successCount % 50 === 0 && successCount > 0) {
+              logger.info(`Capture date backfill progress: ${successCount} updated...`);
+            }
+          } catch (error) {
+            logger.error(`Error backfilling capture date for photo ${photo.id}:`, error);
+            errorCount++;
+          }
+        }
+
+        if (lostClaim) {
+          logger.warn(`Capture date backfill stopped: claim taken over after ${successCount} updated, ${errorCount} errors`);
+          return;
+        }
+        await maintenanceJobs.release(JOB_CAPTURE_DATE_BACKFILL, token, { success: successCount, noExif: missingCount, failed: errorCount, skipped: skippedCount, exif: exifCount, wallClock: wallCount });
+        logger.info(
+          `Capture date backfill complete: ${successCount} updated, ${missingCount} without EXIF, `
+          + `${errorCount} errors, ${skippedCount} skipped (dated or replaced mid-run), `
+          + `${exifCount} with camera details read, ${wallCount} with the camera clock read`
+        );
+      } catch (err) {
+        logger.error('Capture date backfill aborted:', err);
+        await maintenanceJobs
+          .release(JOB_CAPTURE_DATE_BACKFILL, token, { success: successCount, noExif: missingCount, failed: errorCount, skipped: skippedCount, exif: exifCount, wallClock: wallCount, error: err.message })
+          .catch(() => {});
+      } finally {
+        lease.stop();
+      }
+    });
+  } catch (error) {
+    logger.error('Error starting capture date backfill:', error);
+    res.status(500).json({ error: 'Failed to start capture date backfill' });
+  }
+});
+
+// The same permission as the POST, not the read-only system.view. system.view
+// and system.manage are independent grants, and StatusTab has no permission
+// gate of its own — a successful status payload is what renders the card and
+// its enabled button (StatusTab.tsx:637). Gating this on system.view therefore
+// handed a system.view-only role a live button whose every click 403s with no
+// error surfaced. Requiring system.manage makes the card appear only for
+// someone who can actually run it, which is what this comment always claimed.
+router.get('/repair-capture-dates/status', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    // Same scope as the job itself — counting archived photos here would show
+    // a permanent backlog the button can never clear.
+    const scoped = () => db('photos')
+      .join('events', 'photos.event_id', 'events.id')
+      .where(function () {
+        this.where('photos.media_type', '!=', 'video').orWhereNull('photos.media_type');
+      })
+      .where(function () {
+        this.where('photos.type', '!=', 'video').orWhereNull('photos.type');
+      })
+      .where(function () {
+        this.whereNull('photos.mime_type').orWhere('photos.mime_type', 'not like', 'video/%');
+      })
+      .where(function () {
+        this.where('events.is_archived', false).orWhereNull('events.is_archived');
+      });
+
+    // One query, two aggregates. As two separate counts an import committing a
+    // dated photo between them could be counted by the second and not the
+    // first, so withCaptureDate came out larger than total and the card showed
+    // a negative backlog — with the button enabled to "fix" it.
+    const counts = await scoped()
+      .count('photos.id as total')
+      .count({ dated: db.raw('CASE WHEN photos.captured_at IS NOT NULL THEN 1 END') })
+      .count({ pending: db.raw('CASE WHEN photos.captured_at IS NULL OR photos.exif_json IS NULL OR photos.captured_at_wall IS NULL THEN 1 END') })
+      .first();
+
+    const total = Number(counts.total);
+    const withCaptureDate = Number(counts.dated);
+    // Read from the shared row, so this answers the same on every replica.
+    const state = await maintenanceJobs.read(JOB_CAPTURE_DATE_BACKFILL);
+
+    res.json({
+      total,
+      withCaptureDate,
+      withoutCaptureDate: total - withCaptureDate,
+      // What a run would read: no capture date, or camera details never read
+      // (issue 1733, D1).
+      pending: Number(counts.pending),
+      isRunning: state.isRunning,
+      lastResult: state.lastResult
+    });
+  } catch (error) {
+    logger.error('Error fetching capture date backfill status:', error);
+    res.status(500).json({ error: 'Failed to fetch capture date backfill status' });
+  }
+});
+
+/**
+ * Backfill orientation for a library that predates #1185 (#1198).
+ *
+ * The orientation fix corrected the generators and every ingest path, but did
+ * nothing for photos already in the database. Those rows are worse off than
+ * untouched ones in one specific way: before the fix a rotated photo was
+ * CONSISTENTLY wrong — a sideways image in a tile shaped to match. Afterwards
+ * the regenerated thumbnail is correct while photos.width/height still
+ * describe the raw sensor order, so masonry and justified size a portrait
+ * photo with a landscape ratio.
+ *
+ * The dimension repair above cannot reach them: it only selects rows with a
+ * NULL dimension, and an affected row has both — just transposed.
+ *
+ * Its own job rather than a mode of that one, because it does strictly more:
+ * where the EXIF transform means the pixels have moved, the derived images and
+ * face data generated against the old orientation are no longer valid and have
+ * to be invalidated with the write.
+ */
+router.post('/repair-orientation', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    // The trigger is the EXIF tag on the original, and correcting a photo does
+    // not untag it — so without a marker every re-run would throw away the
+    // renditions it just regenerated and requeue every completed face scan.
+    // `force` is the escape hatch for an interrupted run, or for a future fix
+    // that needs to revisit rows this one already cleared.
+    const force = req.body?.force === true || req.query?.force === 'true';
+
+    const token = await maintenanceJobs.claim(JOB_ORIENTATION_BACKFILL);
+    if (!token) {
+      return res.status(409).json({ error: 'Orientation backfill is already running' });
+    }
+    const lease = startLeaseKeeper(JOB_ORIENTATION_BACKFILL, token);
+
+    let photos;
+    try {
+      photos = await db('photos')
+        .join('events', 'photos.event_id', 'events.id')
+        // Videos too (issue 2263): see repairVideo below.
+        // Archiving deletes the originals and keeps the rows, so every archived
+        // photo would fail its read and add nothing but noise to a run that
+        // already walks the whole library.
+        .where(function () {
+          this.where('events.is_archived', false).orWhereNull('events.is_archived');
+        })
+        .modify((q) => {
+          if (!force) q.whereNull('photos.orientation_checked_at');
+        })
+        .select(
+          'photos.id', 'photos.path', 'photos.filename',
+          'photos.source_origin', 'photos.external_relpath', 'photos.event_id',
+          'photos.width', 'photos.height', 'photos.face_status',
+          // Every rendition the invalidation below deletes. Selecting only
+          // preview_path left thumbnail_path and hero_path undefined, so their
+          // database pointers were cleared while the objects stayed in storage.
+          'photos.preview_path', 'photos.thumbnail_path', 'photos.hero_path',
+          'photos.watermark_path',
+          // An external row's tier keys carry its size and mtime
+          // (imageProcessor's sourceVersion); the survivor check below
+          // derives them.
+          'photos.size_bytes', 'photos.source_mtime_ms',
+          // A RAW row's tier keys are scoped by its processing attempt.
+          'photos.processing_attempt_id',
+          // A thumbnail tier's key names the focal point (issue 2377).
+          'photos.focal_x', 'photos.focal_y', 'photos.focal_source',
+          // The video branch: which rows are videos, and the date it fills.
+          'photos.media_type', 'photos.type', 'photos.mime_type', 'photos.captured_at',
+          'events.source_mode', 'events.external_path', 'events.slug'
+        );
+    } catch (err) {
+      lease.stop();
+      await maintenanceJobs.release(JOB_ORIENTATION_BACKFILL, token);
+      throw err;
+    }
+
+    if (photos.length === 0) {
+      lease.stop();
+      await maintenanceJobs.release(JOB_ORIENTATION_BACKFILL, token);
+      return res.json({ message: 'No photos to check', count: 0 });
+    }
+
+    res.json({ message: `Checking orientation for ${photos.length} photos`, count: photos.length });
+
+    applicationWork.defer('photo rendition repair', async () => {
+      const sharp = require('../services/isolatedSharp');
+      const {
+        orientedDimensions, hasOrientationTransform, withLocalCopy, withProcessableImage,
+        deletePreviewTiers, deleteThumbnailTiers, previewTierKeys, thumbnailTierKeys,
+      } = require('../services/imageProcessor');
+      const { getStorage } = require('../services/storage');
+      const { resolvePhotoStorageKey } = require('../services/photoResolver');
+
+      // Fenced on the identity that was measured, not just the id: replacePhoto
+      // — reachable from the replace_by_name upload path (adminPhotos.js) —
+      // swaps a new file under an existing row and rewrites path/filename, so a
+      // replacement landing mid-run would otherwise be given the previous
+      // file's dimensions and have its fresh renditions cleared. An external
+      // file edited in place keeps its path and filename; the size and
+      // mtime the import pass records for it are what change.
+      const fenceOf = (photo) => ({
+        id: photo.id, path: photo.path, filename: photo.filename,
+        ...((photo.source_origin === 'external' || photo.source_origin === 'reference')
+          ? { size_bytes: photo.size_bytes, source_mtime_ms: photo.source_mtime_ms } : {}),
+      });
+      const nowIso = () => new Date().toISOString();
+
+      let checked = 0;
+      let corrected = 0;
+      let requeuedFaces = 0;
+      let staleTiers = 0;
+      let errorCount = 0;
+      let lostClaim = false;
+      let videoDated = 0;
+      let videoPosters = 0;
+
+      // A video stored before issue 2263 was fixed: dimensions as coded, not
+      // as displayed (a portrait phone clip reads as landscape), no capture
+      // date, and a poster squashed into a square. One probe of the original
+      // answers the first two; the poster is rebuilt when it is square and
+      // the video is not, which no poster built since can be. Returns false
+      // when the poster could not be rebuilt, so the row stays a candidate.
+      const repairVideo = async (photo, event, isExternal) => {
+        const { extractVideoMetadata } = require('../services/videoProcessor');
+        const { ensureThumbnail } = require('../services/imageProcessor');
+        const probed = isExternal
+          ? await (async () => {
+            const fullPath = resolvePhotoFilePath(event, photo);
+            await fs.access(fullPath);
+            return extractVideoMetadata(fullPath);
+          })()
+          : await withLocalCopy(resolvePhotoStorageKey(event, photo), async (localPath) => {
+            await fs.access(localPath);
+            return extractVideoMetadata(localPath);
+          });
+        checked++;
+
+        const fence = fenceOf(photo);
+        const values = {};
+        if (probed.width && probed.height && (photo.width !== probed.width || photo.height !== probed.height)) {
+          values.width = probed.width;
+          values.height = probed.height;
+        }
+        if (!photo.captured_at && probed.capturedAt) values.captured_at = probed.capturedAt;
+        if (Object.keys(values).length) {
+          // Dated only while still undated, as in the capture-date backfill.
+          if (values.captured_at && await db('photos').where(fence).whereNull('captured_at')
+            .update({ captured_at: values.captured_at })) videoDated++;
+          delete values.captured_at;
+          if (Object.keys(values).length && await db('photos').where(fence).update(values)) corrected++;
+        }
+
+        const portraitOrLandscape = probed.width && probed.height && probed.width !== probed.height;
+        let posterSquare = !photo.thumbnail_path;
+        if (photo.thumbnail_path && portraitOrLandscape) {
+          const poster = await withLocalCopy(photo.thumbnail_path, localPath => sharp(localPath).metadata())
+            .catch(() => null);
+          posterSquare = !poster || poster.width === poster.height;
+        }
+        if (portraitOrLandscape && posterSquare) {
+          // The whole row, as ensureThumbnail checks the source against it;
+          // gone or replaced since the probe, it is left for the next run.
+          const row = await db('photos').where(fence).first();
+          if (!row) return true;
+          // Unbounded like the admin regenerate job: an admin asked, and
+          // this runs one video at a time. Strict: a frame that cannot be
+          // taken is a failed repair, retried on the next run, not the
+          // placeholder counted as a fixed poster.
+          const key = await ensureThumbnail(row, { force: true, boundVideoSource: false, strictVideoFrame: true });
+          if (!key) return false;
+          videoPosters++;
+          // A video's poster key is attempt-scoped, so the rebuild wrote a
+          // new one; the squashed one is dropped unless another row has it.
+          if (row.thumbnail_path && row.thumbnail_path !== key
+            && !(await db('photos').where('thumbnail_path', row.thumbnail_path).first('id'))) {
+            await getStorage().delete(row.thumbnail_path).catch(() => {});
+          }
+        }
+        return true;
+      };
+
+      try {
+        for (const photo of photos) {
+          if (lease.lost()) { lostClaim = true; break; }
+
+          try {
+            const event = {
+              source_mode: photo.source_mode,
+              external_path: photo.external_path,
+              slug: photo.slug,
+            };
+            const isExternal = photo.source_origin === 'external' || photo.source_origin === 'reference';
+
+            // The same three video markers as the capture-date backfill.
+            if (photo.media_type === 'video' || photo.type === 'video' || String(photo.mime_type || '').startsWith('video/')) {
+              if (await repairVideo(photo, event, isExternal)) {
+                await db('photos').where(fenceOf(photo)).update({ orientation_checked_at: nowIso() });
+              } else {
+                errorCount++;
+              }
+              continue;
+            }
+
+            // Read the metadata the same way every other maintenance path
+            // does. The dimension repair reads with resolvePhotoFilePath and
+            // plain sharp, which means it does nothing at all on an S3 install
+            // and rejects RAW/DNG — this job walks the WHOLE library, so both
+            // of those stop being edge cases.
+            let metadata;
+            if (isExternal) {
+              const fullPath = resolvePhotoFilePath(event, photo);
+              await fs.access(fullPath);
+              const proc = await withProcessableImage(fullPath, photo.filename);
+              try {
+                metadata = await sharp(proc.path).metadata();
+              } finally {
+                await proc.cleanup();
+              }
+            } else {
+              const sourceKey = resolvePhotoStorageKey(event, photo);
+              metadata = await withLocalCopy(sourceKey, async (localPath) => {
+                await fs.access(localPath);
+                const proc = await withProcessableImage(localPath, photo.filename);
+                try {
+                  return await sharp(proc.path).metadata();
+                } finally {
+                  await proc.cleanup();
+                }
+              });
+            }
+
+            checked++;
+
+            const dims = orientedDimensions(metadata);
+            if (!dims.width || !dims.height) continue;
+
+            const dimsWrong = photo.width !== dims.width || photo.height !== dims.height;
+            // Face boxes live in ORIGINAL pixel space and are scaled by
+            // photo.width at read time, so ANY change to the stored dimensions
+            // invalidates them — not only one caused by rotation.
+            // A 5-8 rotation changes the dimensions, so a tagged photo whose
+            // stored dimensions are ALREADY oriented must have been ingested
+            // after #1185 — its renditions are correct and re-clearing them
+            // would delete valid files and rescan faces for nothing. 2, 3 and
+            // 4 leave dimensions untouched, so they carry no such evidence and
+            // are invalidated once; the marker stops it happening twice.
+            // A square image is the exception within 5-8: the rotation is real
+            // but the dimensions come out identical, so it carries no evidence
+            // either and has to be treated like 2/3/4.
+            const swapsDimensions = metadata.orientation >= 5 && metadata.orientation <= 8
+              && metadata.width !== metadata.height;
+            const cannotTell = hasOrientationTransform(metadata) && !swapsDimensions;
+            const facesStale = dimsWrong || cannotTell;
+            // NOT the same question as "did the dimensions change". Orientation
+
+            if (!dimsWrong && !facesStale) {
+              // Nothing to change, but record that it was looked at so a
+              // re-run does not pay for reading it again.
+              await db('photos').where(fenceOf(photo)).update({ orientation_checked_at: nowIso() });
+              continue;
+            }
+
+            // Every write is fenced on the identity we measured, not just the
+            // id. replacePhoto — reachable from the replace_by_name upload path
+            // (adminPhotos.js) — swaps a new file under an existing row and
+            // rewrites path/filename, so a replacement landing while this job
+            // read the old original would otherwise get the previous file's
+            // dimensions written over it and its fresh renditions cleared.
+            // Matching path and filename too means the update affects no rows
+            // instead.
+            const fence = fenceOf(photo);
+
+            // One transaction. If the dimension write commits and the
+            // invalidation does not, the row keeps stale face boxes AND a
+            // retry computes "already correct" — so nothing would ever fix it.
+            let dimsWritten = 0;
+            let invalidated = 0;
+            let markerPending = false;
+            await db.transaction(async (trx) => {
+              if (dimsWrong) {
+                dimsWritten = await trx('photos').where(fence)
+                  .update({ width: dims.width, height: dims.height });
+              }
+
+              if (facesStale) {
+                // Every cached rendition, not just the preview. All three are
+                // regenerated lazily and all three short-circuit on a file
+                // that is merely VALID — and a pre-fix sideways thumbnail is
+                // perfectly valid. Clearing only the preview fixed the face
+                // data while leaving the gallery showing the old sideways
+                // image inside a newly-corrected portrait tile, which is worse
+                // than not having run at all.
+                //
+                // The preview specifically must go before faces are requeued:
+                // ensurePreviewImage would otherwise hand the rescan the old
+                // unrotated pixels, whose boxes then get scaled by the
+                // corrected dimensions.
+                invalidated = await trx('photos').where(fence).update({
+                  preview_path: null,
+                  thumbnail_path: null,
+                  hero_path: null,
+                  // gallery.js serves watermark_path ahead of the original when
+                  // branding watermarking is on, so a stale one is the single
+                  // most visible rendition of all.
+                  watermark_path: null,
+                });
+
+                // whereNotNull: face_status NULL means this photo was never
+                // scanned, and an install that never enabled the feature must
+                // not start scanning because of a dimension repair.
+                requeuedFaces += await trx('photos')
+                  .where(fence)
+                  .whereNotNull('face_status')
+                  .whereNot('face_status', 'pending')
+                  // Voids a scan in flight on the old dimensions (issue 2069).
+                  .update({ face_status: 'pending', face_attempt_id: null });
+              }
+
+              // Same transaction as the work it records: a marker written
+              // separately could survive a rolled-back correction and hide the
+              // row from every future run. Withheld below if the storage
+              // cleanup then fails, so the row stays eligible for a retry.
+              markerPending = true;
+            });
+
+            // Outside the transaction on purpose: these delete files, and a
+            // storage error must not roll back a correct database write. A
+            // rolled-back write is silent corruption; a leftover object is not.
+            //
+            // For the canonical renditions a failed delete is harmless — their
+            // keys are deterministic, so regeneration overwrites in place. The
+            // responsive TIERS are the exception: ensurePreviewImageAtWidth
+            // treats storage.stat(key) as a cache hit, so a tier that survived
+            // deletion keeps being served unrotated and never regenerates. The
+            // tier helpers swallow their own errors, so the keys are re-checked
+            // and anything still standing is counted — a run that could not
+            // clear them should not report itself as clean.
+            // Only when a fenced write actually landed. If the file was
+            // replaced mid-run every update matched zero rows, and deleting
+            // now would destroy renditions belonging to the REPLACEMENT —
+            // watermarks especially, which are keyed by photo id and so alias
+            // straight onto the new file.
+            if (facesStale && invalidated > 0) {
+              const storage = getStorage();
+              for (const key of [photo.preview_path, photo.thumbnail_path, photo.hero_path, photo.watermark_path]) {
+                if (key) await storage.delete(key).catch(() => {});
+              }
+              await deletePreviewTiers(photo).catch(() => {});
+              await deleteThumbnailTiers(photo).catch(() => {});
+
+              // stat() RESOLVES with null for a missing key rather than
+              // rejecting, so testing only that the promise settled counted
+              // every deleted — and every never-created — tier as a survivor,
+              // and told the operator to re-run after a perfectly clean pass.
+              // A rejection is a real storage error, which is also not proof
+              // the object is gone, so it counts as stuck.
+              const survivors = await Promise.all(
+                [...previewTierKeys(photo), ...thumbnailTierKeys(photo)]
+                  .map((k) => storage.stat(k).then((st) => (st ? k : null)).catch(() => k))
+              );
+              const stuck = survivors.filter(Boolean).length;
+              if (stuck) {
+                staleTiers += stuck;
+                // Leave the row unmarked so the ordinary (non-force) re-run
+                // the UI recommends actually finds it again. Marking it here
+                // would make that advice impossible to follow.
+                markerPending = false;
+                logger.warn(
+                  `Orientation backfill: ${stuck} tier(s) survived deletion for photo ${photo.id} — `
+                  + 'they will keep serving unrotated until storage is writable and this is re-run'
+                );
+              }
+            }
+
+            if (markerPending) {
+              await db('photos').where(fence).update({ orientation_checked_at: nowIso() });
+            }
+
+            // From the affected-row count, not the intent: if the fence
+            // rejected the write because the file was replaced mid-run, the
+            // photo was not corrected and must not be reported as such.
+            if (dimsWritten > 0) corrected++;
+
+            if ((corrected + requeuedFaces) % 50 === 0 && (corrected + requeuedFaces) > 0) {
+              logger.info(`Orientation backfill progress: ${corrected} corrected...`);
+            }
+          } catch (error) {
+            logger.error(`Error backfilling orientation for photo ${photo.id}:`, error);
+            errorCount++;
+          }
+        }
+
+        if (lostClaim) {
+          logger.warn(`Orientation backfill stopped: claim taken over after ${corrected} corrected`);
+          return;
+        }
+        await maintenanceJobs.release(JOB_ORIENTATION_BACKFILL, token, {
+          checked, corrected, requeuedFaces, staleTiers, failed: errorCount, videoDated, videoPosters,
+        });
+        logger.info(
+          `Orientation backfill complete: ${checked} checked, ${corrected} corrected, `
+          + `${requeuedFaces} requeued for face scanning, ${errorCount} errors`
+        );
+      } catch (err) {
+        logger.error('Orientation backfill aborted:', err);
+        await maintenanceJobs
+          .release(JOB_ORIENTATION_BACKFILL, token, {
+            checked, corrected, requeuedFaces, staleTiers, failed: errorCount, videoDated, videoPosters, error: err.message,
+          })
+          .catch(() => {});
+      } finally {
+        lease.stop();
+      }
+    });
+  } catch (error) {
+    logger.error('Error starting orientation backfill:', error);
+    res.status(500).json({ error: 'Failed to start orientation backfill' });
+  }
+});
+
+router.get('/repair-orientation/status', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    const state = await maintenanceJobs.read(JOB_ORIENTATION_BACKFILL);
+    res.json({ isRunning: state.isRunning, lastResult: state.lastResult });
+  } catch (error) {
+    logger.error('Error fetching orientation backfill status:', error);
+    res.status(500).json({ error: 'Failed to fetch orientation backfill status' });
+  }
+});
+
+/**
+ * Backfill photo credits from EXIF (#1561).
+ *
+ * New photos get their credit at ingest (services/photoCredit.js). A library
+ * that predates the feature has none, and — same reasoning as the capture-date
+ * backfill above — this is an endpoint rather than a migration: the originals
+ * may sit on a mount that is unavailable at upgrade time, and a run that found
+ * nothing must be repeatable once it is back. Same claim + lease shape too.
+ *
+ * Candidates are rows whose credit nobody has decided yet: credit_source IS
+ * NULL, or 'account' (the uploader's fallback name, issue 743, which a name
+ * in the file replaces). That skips `manual` (the admin's call is final), `guest` (a guest
+ * upload credits the guest, never EXIF) and `exif` (already read). Guest
+ * uploads without a name are skipped on uploaded_by — their EXIF is phone
+ * noise the resolver deliberately ignores. Guest photos queued before #1561
+ * were recorded as 'admin' and cannot be told apart; they are read like any
+ * admin upload.
+ */
+function creditCandidates() {
+  return db('photos')
+    .join('events', 'photos.event_id', 'events.id')
+    .where((q) => q.whereNull('photos.credit_source').orWhere('photos.credit_source', 'account'))
+    .where(function () {
+      this.where('photos.uploaded_by', '!=', 'guest').orWhereNull('photos.uploaded_by');
+    })
+    // Same three video markers as the capture-date backfill: EXIF credits are
+    // read from images only.
+    .where(function () {
+      this.where('photos.media_type', '!=', 'video').orWhereNull('photos.media_type');
+    })
+    .where(function () {
+      this.where('photos.type', '!=', 'video').orWhereNull('photos.type');
+    })
+    .where(function () {
+      this.whereNull('photos.mime_type').orWhere('photos.mime_type', 'not like', 'video/%');
+    })
+    // Archived originals are inside the zip, not on storage.
+    .where(function () {
+      this.where('events.is_archived', false).orWhereNull('events.is_archived');
+    });
+}
+
+router.post('/repair-credits', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    const token = await maintenanceJobs.claim(JOB_CREDIT_BACKFILL);
+    if (!token) {
+      return res.status(409).json({ error: 'Credit backfill is already running' });
+    }
+    const lease = startLeaseKeeper(JOB_CREDIT_BACKFILL, token);
+
+    let photos;
+    try {
+      photos = await creditCandidates().select(
+        'photos.id', 'photos.path', 'photos.filename',
+        'photos.source_origin', 'photos.external_relpath', 'photos.event_id',
+        'events.source_mode', 'events.external_path', 'events.slug'
+      );
+    } catch (err) {
+      lease.stop();
+      await maintenanceJobs.release(JOB_CREDIT_BACKFILL, token);
+      throw err;
+    }
+
+    if (photos.length === 0) {
+      lease.stop();
+      await maintenanceJobs.release(JOB_CREDIT_BACKFILL, token);
+      return res.json({ message: 'No photos need a credit', count: 0 });
+    }
+
+    res.json({
+      message: `Started reading credits for ${photos.length} photos`,
+      count: photos.length
+    });
+
+    applicationWork.defer('photo rendition repair', async () => {
+      const { withLocalCopy } = require('../services/imageProcessor');
+      const { resolvePhotoStorageKey } = require('../services/photoResolver');
+      const { extractExifCredit } = require('../services/photoCredit');
+      let successCount = 0;
+      let missingCount = 0;
+      let errorCount = 0;
+      let skippedCount = 0;
+      let lostClaim = false;
+
+      try {
+        for (const photo of photos) {
+          if (lease.lost()) { lostClaim = true; break; }
+
+          try {
+            const event = { source_mode: photo.source_mode, external_path: photo.external_path, slug: photo.slug };
+            const isExternal = photo.source_origin === 'external' || photo.source_origin === 'reference';
+
+            // Two source shapes, the same split as the capture-date backfill.
+            let name;
+            if (isExternal) {
+              let fullPath;
+              try {
+                fullPath = resolvePhotoFilePath(event, photo);
+                await fs.access(fullPath);
+              } catch (err) {
+                logger.warn(`Credit backfill: no readable file for photo ${photo.id}: ${err.message}`);
+                errorCount++;
+                continue;
+              }
+              name = await extractExifCredit(fullPath);
+            } else {
+              let sourceKey;
+              try {
+                sourceKey = resolvePhotoStorageKey(event, photo);
+              } catch (err) {
+                logger.warn(`Credit backfill: no storage key for photo ${photo.id}: ${err.message}`);
+                errorCount++;
+                continue;
+              }
+              name = await withLocalCopy(sourceKey, async (localPath) => {
+                await fs.access(localPath);
+                return extractExifCredit(localPath);
+              });
+            }
+
+            if (!name) {
+              missingCount++;
+              continue;
+            }
+
+            // Fenced on the identity that was read (a replacement mid-run
+            // swaps the file under the row, see the capture-date backfill) and
+            // on credit_source still being NULL (or the account fallback), so
+            // an admin correction or a guest credit written meanwhile is never
+            // overwritten.
+            const updated = await db('photos')
+              .where({ id: photo.id, path: photo.path, filename: photo.filename })
+              .where((q) => q.whereNull('credit_source').orWhere('credit_source', 'account'))
+              .update({ credit_name: name, credit_source: 'exif' });
+            if (updated) successCount++; else skippedCount++;
+          } catch (error) {
+            logger.error(`Error backfilling credit for photo ${photo.id}:`, error);
+            errorCount++;
+          }
+        }
+
+        if (lostClaim) {
+          logger.warn(`Credit backfill stopped: claim taken over after ${successCount} updated, ${errorCount} errors`);
+          return;
+        }
+        await maintenanceJobs.release(JOB_CREDIT_BACKFILL, token, { success: successCount, noCredit: missingCount, failed: errorCount, skipped: skippedCount });
+        logger.info(
+          `Credit backfill complete: ${successCount} updated, ${missingCount} without a credit, `
+          + `${errorCount} errors, ${skippedCount} skipped (decided or replaced mid-run)`
+        );
+      } catch (err) {
+        logger.error('Credit backfill aborted:', err);
+        await maintenanceJobs
+          .release(JOB_CREDIT_BACKFILL, token, { success: successCount, noCredit: missingCount, failed: errorCount, skipped: skippedCount, error: err.message })
+          .catch(() => {});
+      } finally {
+        lease.stop();
+      }
+    });
+  } catch (error) {
+    logger.error('Error starting credit backfill:', error);
+    res.status(500).json({ error: 'Failed to start credit backfill' });
+  }
+});
+
+// system.manage for the same reason as the capture-date status above.
+router.get('/repair-credits/status', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    const counts = await db('photos')
+      .count('photos.id as total')
+      .count({ credited: db.raw('CASE WHEN photos.credit_name IS NOT NULL THEN 1 END') })
+      .first();
+    // Undecided rows are what a run would read. Rows without EXIF stay
+    // undecided, so this is "what the button would look at", not a backlog
+    // that a finished run always clears.
+    const pending = await creditCandidates().count('photos.id as count').first();
+    const state = await maintenanceJobs.read(JOB_CREDIT_BACKFILL);
+    res.json({
+      total: Number(counts.total),
+      withCredit: Number(counts.credited),
+      undecided: Number(pending.count),
+      isRunning: state.isRunning,
+      lastResult: state.lastResult
+    });
+  } catch (error) {
+    logger.error('Error fetching credit backfill status:', error);
+    res.status(500).json({ error: 'Failed to fetch credit backfill status' });
+  }
+});
+
+/**
+ * Backfill tile placeholders (issue 1733, B1).
+ *
+ * New thumbnails get their ThumbHash when they are generated
+ * (services/thumbHash.js). A library that predates the column has none, and
+ * its tiles simply keep the plain loading state until this has run. Opt-in
+ * and an endpoint rather than a migration, like the backfills above: it reads
+ * through the storage backend, which may be unreachable at upgrade time.
+ *
+ * It reads THUMBNAILS, never originals: a few kilobytes per photo, on S3 and
+ * for external libraries alike (their thumbnails are managed objects too).
+ *
+ * Resumable by construction. A candidate is a row with a thumbnail and no
+ * hash, so a run that was interrupted leaves the rest as candidates and the
+ * next run picks up there. Rows are fetched in id order, a batch at a time,
+ * so memory stays flat however large the library is, and a thumbnail that
+ * cannot be read is passed over for this run instead of being retried in a
+ * loop.
+ */
+const THUMB_HASH_BATCH = 200;
+
+function thumbHashCandidates() {
+  return db('photos')
+    .join('events', 'photos.event_id', 'events.id')
+    .whereNotNull('photos.thumbnail_path')
+    // An archived event's renditions are gone with the archive.
+    .where(function () {
+      this.where('events.is_archived', false).orWhereNull('events.is_archived');
+    });
+}
+
+router.post('/repair-thumb-hashes', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    const token = await maintenanceJobs.claim(JOB_THUMB_HASH_BACKFILL);
+    if (!token) {
+      return res.status(409).json({ error: 'Placeholder backfill is already running' });
+    }
+    const lease = startLeaseKeeper(JOB_THUMB_HASH_BACKFILL, token);
+
+    let count;
+    try {
+      const pending = await thumbHashCandidates().whereNull('photos.thumb_hash').count('photos.id as count').first();
+      count = Number(pending.count);
+    } catch (err) {
+      lease.stop();
+      await maintenanceJobs.release(JOB_THUMB_HASH_BACKFILL, token);
+      throw err;
+    }
+
+    if (count === 0) {
+      lease.stop();
+      await maintenanceJobs.release(JOB_THUMB_HASH_BACKFILL, token);
+      return res.json({ message: 'No photos need a placeholder', count: 0 });
+    }
+
+    res.json({ message: `Started computing placeholders for ${count} photos`, count });
+
+    applicationWork.defer('photo rendition repair', async () => {
+      const { withLocalCopy } = require('../services/imageProcessor');
+      const { computeThumbHash } = require('../services/thumbHash');
+      let successCount = 0;
+      let errorCount = 0;
+      let skippedCount = 0;
+      let lostClaim = false;
+      let lastId = 0;
+
+      try {
+        for (;;) {
+          const batch = await thumbHashCandidates()
+            .whereNull('photos.thumb_hash')
+            .where('photos.id', '>', lastId)
+            .orderBy('photos.id')
+            .limit(THUMB_HASH_BATCH)
+            .select('photos.id', 'photos.thumbnail_path');
+          if (batch.length === 0) break;
+
+          for (const photo of batch) {
+            if (lease.lost()) { lostClaim = true; break; }
+            lastId = photo.id;
+
+            try {
+              const hash = await withLocalCopy(photo.thumbnail_path, (localPath) => computeThumbHash(localPath));
+              if (!hash) {
+                errorCount++;
+                continue;
+              }
+              // Fenced on the thumbnail that was read: a replacement or a
+              // regeneration mid-run writes its own hash with its own key.
+              const updated = await db('photos')
+                .where({ id: photo.id, thumbnail_path: photo.thumbnail_path })
+                .whereNull('thumb_hash')
+                .update({ thumb_hash: hash });
+              if (updated) successCount++; else skippedCount++;
+            } catch (error) {
+              logger.warn(`Placeholder backfill: thumbnail of photo ${photo.id} could not be read: ${error.message}`);
+              errorCount++;
+            }
+          }
+          if (lostClaim) break;
+        }
+
+        if (lostClaim) {
+          logger.warn(`Placeholder backfill stopped: claim taken over after ${successCount} updated, ${errorCount} errors`);
+          return;
+        }
+        await maintenanceJobs.release(JOB_THUMB_HASH_BACKFILL, token, { success: successCount, failed: errorCount, skipped: skippedCount });
+        logger.info(
+          `Placeholder backfill complete: ${successCount} updated, ${errorCount} unreadable, `
+          + `${skippedCount} skipped (changed mid-run)`
+        );
+      } catch (err) {
+        logger.error('Placeholder backfill aborted:', err);
+        await maintenanceJobs
+          .release(JOB_THUMB_HASH_BACKFILL, token, { success: successCount, failed: errorCount, skipped: skippedCount, error: err.message })
+          .catch(() => {});
+      } finally {
+        lease.stop();
+      }
+    });
+  } catch (error) {
+    logger.error('Error starting placeholder backfill:', error);
+    res.status(500).json({ error: 'Failed to start placeholder backfill' });
+  }
+});
+
+// system.manage for the same reason as the capture-date status above.
+router.get('/repair-thumb-hashes/status', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    const counts = await thumbHashCandidates()
+      .count('photos.id as total')
+      .count({ hashed: db.raw('CASE WHEN photos.thumb_hash IS NOT NULL THEN 1 END') })
+      .first();
+    const total = Number(counts.total);
+    const withPlaceholder = Number(counts.hashed);
+    const state = await maintenanceJobs.read(JOB_THUMB_HASH_BACKFILL);
+    res.json({
+      total,
+      withPlaceholder,
+      withoutPlaceholder: total - withPlaceholder,
+      isRunning: state.isRunning,
+      lastResult: state.lastResult
+    });
+  } catch (error) {
+    logger.error('Error fetching placeholder backfill status:', error);
+    res.status(500).json({ error: 'Failed to fetch placeholder backfill status' });
+  }
+});
+
+// Content-hash backfill (issue 2194): see services/contentHashBackfill.js.
+// Reads every original without a hash once, so it starts from this button
+// only, and can be paused; a later start resumes where it stopped.
+// system.manage for the same reason as the other sweeps.
+router.post('/repair-content-hashes', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    const backfill = require('../services/contentHashBackfill');
+    const started = await backfill.start({ retryUnreadable: req.body?.retryUnreadable === true });
+    if (!started) {
+      return res.status(409).json({ error: 'Content-hash backfill is already running' });
+    }
+    if (!started.run) {
+      return res.json({ message: 'No photos need a content hash', count: 0 });
+    }
+    res.json({ message: `Started hashing ${started.count} originals`, count: started.count });
+    applicationWork.defer('photo content hash backfill', started.run);
+  } catch (error) {
+    logger.error('Error starting content-hash backfill:', error);
+    res.status(500).json({ error: 'Failed to start content-hash backfill' });
+  }
+});
+
+router.post('/repair-content-hashes/pause', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    if (!(await require('../services/contentHashBackfill').pause())) {
+      return res.status(409).json({ error: 'Content-hash backfill is not running' });
+    }
+    res.json({ message: 'Pausing after the current file' });
+  } catch (error) {
+    logger.error('Error pausing content-hash backfill:', error);
+    res.status(500).json({ error: 'Failed to pause content-hash backfill' });
+  }
+});
+
+router.get('/repair-content-hashes/status', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    res.json(await require('../services/contentHashBackfill').status());
+  } catch (error) {
+    logger.error('Error fetching content-hash backfill status:', error);
+    res.status(500).json({ error: 'Failed to fetch content-hash backfill status' });
+  }
+});
+
+// Progress of the background pass that regenerates renditions written before
+// EXIF stripping (issue 2096). It starts by itself at boot, so there is no
+// POST; system.manage like the other maintenance status endpoints.
+router.get('/refresh-renditions/status', adminAuth, requirePermission('system.manage'), async (req, res) => {
+  try {
+    res.json(await require('../services/renditionRefresh').status());
+  } catch (error) {
+    logger.error('Error fetching rendition refresh status:', error);
+    res.status(500).json({ error: 'Failed to fetch rendition refresh status' });
+  }
+});
+
+module.exports = router;

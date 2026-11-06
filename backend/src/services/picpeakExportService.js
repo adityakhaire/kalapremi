@@ -1,0 +1,396 @@
+'use strict';
+
+// Portable ".picpeak" export — a single, self-describing archive that can be
+// downloaded from one instance and re-uploaded to another via the web UI only
+// (see picpeakImportService for the receiving half).
+//
+// Deliberately ENGINE-NEUTRAL: instead of a native pg_dump / sqlite .backup
+// (which can only ever restore into the same engine and version), each table is
+// written as NDJSON. The target rebuilds its own schema by running migrations,
+// then loads these rows into it — so an older backup restores cleanly onto a
+// newer target (forward-only), and pg↔pg / sqlite↔sqlite both work.
+//
+// This module is purely additive: it introduces a new artifact and touches no
+// existing backup/restore path.
+
+const fs = require('fs');
+const fsp = require('fs').promises;
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const archiver = require('archiver');
+const { db } = require('../database/db');
+const knexConfig = require('../../knexfile');
+const { getStoragePath } = require('../config/storage');
+const logger = require('../utils/logger');
+const { collectLegacyStoredFiles, storedPathMap } = require('../utils/legacyStoredFiles');
+const { STORED_PATH_COLUMNS } = require('../utils/storedPath');
+const packageJson = require('../../package.json');
+const recoveryFiles = require('./recoveryFiles');
+const { getStorage } = require('./storage');
+
+// Bump only on a breaking change to the on-disk layout below.
+const PICPEAK_FORMAT_VERSION = 1;
+
+// Never exported as data — the target owns these (its own migrations set them).
+//
+// photo_faces / event_people (#1074) are excluded for a different reason:
+// face embeddings are biometric data (GDPR Art. 9), and this export gets
+// handed to clients and moved between operators. The data is fully derived
+// from the photos, so the target re-scans rather than receiving biometrics it
+// has no lawful basis for. NOTE the cost of that decision: any names the
+// photographer assigned to people are lost too, since they live in
+// event_people. That is accepted — see ml/README.md and the #1074 thread.
+const EXCLUDED_TABLES = new Set([
+  'print_sales_downloads', // Ephemeral browser delivery status, not retained orders.
+  'knex_migrations',
+  'knex_migrations_lock',
+  'photo_faces',
+  'event_people',
+  // Follows event_people out of the export (#1107): these rows are nothing but
+  // references to person ids the target will never receive. Carried across,
+  // they would attach to whatever ids the target's own re-scan happens to
+  // mint, silently suppressing merge suggestions in unrelated galleries.
+  'event_people_merge_dismissals',
+  // Short-lived promo verification state, not data: code and identity hashes
+  // are worthless after restore and should not leave the install in an archive.
+  'photo_checkout_verifications',
+  // Live lease state for the maintenance sweeps (#1181), not data. An archive
+  // taken while a sweep was running would otherwise carry is_running = true and
+  // a claim token belonging to a process on the source install. Restored within
+  // the staleness window, the target reports the job as running and refuses new
+  // POSTs, with no runner anywhere that could release it. The table is seeded
+  // by its migration, so the target already has the rows it needs.
+  'maintenance_jobs',
+  // Physical primary-S3 generations belong to THIS target's object store.
+  // Portable archives carry logical files, never runtime read redirections.
+  ...require('../utils/restoreRuntimeTables'),
+]);
+
+// Storage subdirs holding non-recalculable blobs — always included.
+const DOC_DIRS = ['business-docs', 'uploads', 'transfers', 'album-products', '.print-sales'];
+// Original gallery photos — only when includePhotos is true (large; otherwise
+// the admin re-uploads originals per gallery and previews are re-rendered).
+const PHOTO_DIRS = ['events/active', 'events/archived', 'thumbnails', 'previews', 'heroes', 'videos', 'watermarks'];
+
+const isPostgres = () => knexConfig.client === 'pg';
+
+// db.raw returns `{ rows: [...] }` on Postgres and a bare array on SQLite.
+const rawRows = (result) => (isPostgres() ? result.rows : result);
+
+// All user tables, minus knex bookkeeping. Introspected at runtime so the
+// export never rots as tables are added (no hardcoded list to maintain).
+async function listDataTables() {
+  let names;
+  if (isPostgres()) {
+    const result = await db.raw(`
+      SELECT table_name AS name
+      FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+      ORDER BY table_name
+    `);
+    names = rawRows(result).map((r) => r.name);
+  } else {
+    const result = await db.raw(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `);
+    names = rawRows(result).map((r) => r.name);
+  }
+  return names.filter((n) => !EXCLUDED_TABLES.has(n));
+}
+
+// The latest applied migration — recorded in the manifest so the importer can
+// refuse a backup that is NEWER than the target (forward-only guarantee).
+async function getLatestMigration() {
+  try {
+    const rows = await db('knex_migrations').orderBy('id', 'desc').limit(1);
+    return rows[0]?.name || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Write one table to <dataDir>/<table>.ndjson (one JSON object per line).
+// Returns { rowCount, checksum } for the manifest. JSON.stringify serialises
+// Dates to ISO strings, which re-import cleanly on both engines.
+//
+// Uses a plain select rather than knex `.stream()`: streaming on Postgres pulls
+// in the optional `pg-query-stream` dependency (not bundled), so it throws on
+// pg. A select works on both engines with no extra dependency. Rows are DB
+// metadata (blobs live on disk under files/), so holding a table in memory is
+// fine for the instance sizes PicPeak targets.
+// `pathMap` ({ stored value: archived path }, legacy-root documents) is
+// applied to the stored-path columns as the rows are written, so the archive
+// names each document where its bytes are, for any importer.
+async function writeTableNdjson(table, dataDir, pathMap = null, onRows) {
+  const outPath = path.join(dataDir, `${table}.ndjson`);
+  const hash = crypto.createHash('sha256');
+  const pathColumns = pathMap
+    ? STORED_PATH_COLUMNS.filter((c) => c.table === table).map((c) => c.column)
+    : [];
+  const rows = (await db(table).select('*')).map((row) => {
+    if (!pathColumns.length) return row;
+    const out = { ...row };
+    for (const col of pathColumns) {
+      if (typeof out[col] === 'string' && Object.prototype.hasOwnProperty.call(pathMap, out[col])) {
+        out[col] = pathMap[out[col]];
+      }
+    }
+    return out;
+  });
+  let largestRowBytes = 0;
+  const lines = rows.map((row) => {
+    // photo_faces / event_people are excluded from the export (#1074), so a
+    // restored install has no face data — but `photos.face_status = 'done'`
+    // would come across intact and the worker only ever claims 'pending'.
+    // The gallery would then report itself fully scanned while showing no
+    // people at all, permanently, with no way to tell why.
+    //
+    // Reset the derived state so the target simply re-scans once the operator
+    // enables the feature there.
+    const line = JSON.stringify(
+      table === 'photos' && (row.face_status !== null && row.face_status !== undefined)
+        ? { ...row, face_status: null, face_count: null, face_started_at: null, face_error: null }
+        : row
+    );
+    hash.update(`${line}\n`);
+    largestRowBytes = Math.max(largestRowBytes, Buffer.byteLength(line));
+    return line;
+  });
+  if (onRows) onRows(table, rows);
+  await fsp.writeFile(outPath, lines.length ? `${lines.join('\n')}\n` : '', 'utf8');
+  // largestRowBytes stays out of the manifest: it only feeds the export's own
+  // check against the importer's defaults.
+  return { rowCount: rows.length, checksum: hash.digest('hex'), largestRowBytes };
+}
+
+// An instance must be able to import what it exports. Where an export goes
+// beyond what an importer accepts by default, say so and name the variable
+// the importing instance has to raise.
+function importLimitWarnings({ entries, expandedBytes, manifestBytes, largestRowBytes }) {
+  const defaults = require('./portableImportArchive').HARD_LIMITS;
+  const rowBytes = require('./portableImportRows').MAX_ROW_BYTES;
+  const warnings = [];
+  if (entries > defaults.entries) warnings.push(`${entries} entries exceed the import default of ${defaults.entries}; set PICPEAK_IMPORT_MAX_ENTRIES on the importing instance`);
+  if (expandedBytes > defaults.expandedBytes) warnings.push(`${expandedBytes} bytes exceed the import default of ${defaults.expandedBytes}; set PICPEAK_IMPORT_MAX_EXPANDED_BYTES on the importing instance`);
+  if (manifestBytes > defaults.manifestBytes) warnings.push(`a ${manifestBytes}-byte manifest exceeds the import default of ${defaults.manifestBytes}; set PICPEAK_IMPORT_MAX_MANIFEST_BYTES on the importing instance`);
+  if (largestRowBytes > rowBytes) warnings.push(`a ${largestRowBytes}-byte row exceeds the import default of ${rowBytes}; set PICPEAK_IMPORT_MAX_ROW_BYTES on the importing instance`);
+  return warnings;
+}
+
+// Recursively collect files under a storage subdir as { abs, rel } where rel is
+// relative to the storage root (so the importer restores the same layout).
+async function collectDir(subdir, storageRoot, acc) {
+  const abs = path.join(storageRoot, subdir);
+  let entries;
+  try {
+    entries = await fsp.readdir(abs, { withFileTypes: true });
+  } catch (_) {
+    return; // subdir may not exist on this install — skip silently
+  }
+  for (const entry of entries) {
+    const childRel = path.join(subdir, entry.name);
+    if (recoveryFiles.printTemporaryKey(childRel.split(path.sep).join('/'))) continue;
+    if (entry.isDirectory()) {
+      await collectDir(childRel, storageRoot, acc);
+    } else if (entry.isFile()) {
+      acc.push({ abs: path.join(storageRoot, childRel), rel: childRel });
+    }
+  }
+}
+
+async function collectFiles(includePhotos, requiredReferences) {
+  const storageRoot = getStoragePath();
+  const dirs = includePhotos ? [...DOC_DIRS, ...PHOTO_DIRS] : [...DOC_DIRS];
+  const acc = [];
+  for (const d of dirs) {
+    await collectDir(d, storageRoot, acc);
+  }
+  if (getStorage().kind() !== 's3') return recoveryFiles.localPrintInventory(db, acc, key => dirs.some(root => key.startsWith(`${root}/`)));
+  const remote = await recoveryFiles.adapterInventory(db, dirs, undefined, requiredReferences);
+  return [...acc.filter(file => !recoveryFiles.managedKey(file.rel.split(path.sep).join('/'))),
+    ...remote.map(file => ({ ...file, rel: file.relativePath }))];
+}
+
+// Local storage is archived from where it lies: only the catalogue entry
+// (size + sha256) is computed here, nothing is copied to the temp disk.
+async function catalogueInPlace(files) {
+  const byKey = new Map();
+  for (const file of files) {
+    const key = recoveryFiles.validKey(file.rel.split(path.sep).join('/'));
+    let handle;
+    try { handle = await fsp.open(file.abs, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0)); }
+    catch (error) { if (await recoveryFiles.discardedPrintFile(db, key, error)) continue; throw error; }
+    const hash = crypto.createHash('sha256');
+    let size = 0;
+    try {
+      if (!(await handle.stat()).isFile()) throw new Error(`Not a regular recovery source: ${key}`);
+      for await (const chunk of handle.createReadStream({ autoClose: false })) { hash.update(chunk); size += chunk.length; }
+    } finally { await handle.close().catch(() => {}); }
+    const checksum = hash.digest('hex');
+    const existing = byKey.get(key);
+    if (existing) {
+      if (existing.checksum !== checksum) throw new Error(`Conflicting recovery sources for ${key}`);
+      continue;
+    }
+    byKey.set(key, { ...file, relativePath: key, size, checksum });
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * Build a .picpeak archive.
+ * @param {Object} opts
+ * @param {boolean} [opts.includePhotos=false] include original gallery photos
+ * @param {string}  [opts.outDir] where to write the file (defaults to a temp dir)
+ * @returns {Promise<{ filePath: string, manifest: object }>}
+ */
+async function createPicpeak({ includePhotos = false, includeFiles = true, outDir } = {}) {
+  const staging = await fsp.mkdtemp(path.join(os.tmpdir(), 'picpeak-export-'));
+  const dataDir = path.join(staging, 'data');
+  await fsp.mkdir(dataDir, { recursive: true });
+
+  try {
+    // 1. Dump every table to NDJSON, tracking counts + checksums.
+    // Documents a row names in the legacy root (<cwd>/storage) when that is
+    // not the storage root: the file walk below never sees them. They go into
+    // the archive under a storage-relative path, and the rows are written
+    // naming that path (writeTableNdjson).
+    const legacyFiles = includeFiles ? await collectLegacyStoredFiles(db) : [];
+    const pathMap = legacyFiles.length ? storedPathMap(legacyFiles) : null;
+    const tables = await listDataTables();
+    const tableMeta = {};
+    const referenceRows = new Map();
+    let largestRowBytes = 0;
+    let tableBytes = 0;
+    for (const table of tables) {
+      const { largestRowBytes: largest, ...meta } = await writeTableNdjson(table, dataDir, pathMap, (name, rows) => {
+        if (['events', 'photos', 'customer_documents', 'transfer_uploads', 'transfer_extra_files', 'print_sales_assets'].includes(name)) referenceRows.set(name, rows);
+      });
+      tableMeta[table] = meta;
+      largestRowBytes = Math.max(largestRowBytes, largest);
+      tableBytes += (await fsp.stat(path.join(dataDir, `${table}.ndjson`))).size;
+    }
+
+    // 2. Gather the non-recalculable blobs (PDFs, business-docs, uploads, and
+    //    optionally original photos).
+    // includeFiles:false is for the SQLite → Postgres migration (#1038): it moves
+    // rows between engines on the SAME install, so the storage volume is already
+    // correct. Copying every business doc through /tmp and back would only risk
+    // filling the temp disk.
+    const roots = includePhotos ? [...DOC_DIRS, ...PHOTO_DIRS] : DOC_DIRS;
+    const references = includeFiles && getStorage().kind() === 's3'
+      ? [...await recoveryFiles.requiredKeys(referenceRows, key => roots.some(root => key.startsWith(`${root}/`)))] : [];
+    let files = includeFiles ? await collectFiles(includePhotos, references) : [];
+    for (const f of legacyFiles) files.push({ abs: f.abs, rel: f.rel.split('/').join(path.sep) });
+    if (includeFiles && getStorage().kind() === 's3') {
+      // An export is the whole estate: no per-file ceiling, or one long
+      // video fails it.
+      const fileStage = path.join(staging, 'captured');
+      await fsp.mkdir(fileStage, { mode: 0o700 });
+      files = await recoveryFiles.materialize(files, fileStage, Number.MAX_SAFE_INTEGER, db);
+    } else if (includeFiles) {
+      // Print files can be discarded after the catalogue but before ZIP reads.
+      // Capture only this changing private estate; the media library stays in place.
+      const printFiles = files.filter(file => (file.relativePath || file.rel).startsWith('.print-sales/'));
+      const captured = printFiles.length
+        ? await recoveryFiles.materialize(printFiles, path.join(staging, 'captured'), Number.MAX_SAFE_INTEGER, db) : [];
+      files = await catalogueInPlace([...files.filter(file => !printFiles.includes(file)), ...captured]);
+    }
+
+    // 3. Manifest — everything the importer needs to validate + reconstruct.
+    const manifest = {
+      format: PICPEAK_FORMAT_VERSION,
+      kind: 'picpeak-backup',
+      created_at: new Date().toISOString(),
+      app_version: packageJson.version || null,
+      database: {
+        engine: isPostgres() ? 'pg' : 'sqlite',
+        latest_migration: await getLatestMigration(),
+      },
+      options: { includePhotos: !!includePhotos, includeFiles: !!includeFiles },
+      tables: tableMeta,
+      // Per gallery id (issue 2012): zips under events/archived no gallery
+      // names, and a failed expiry archive's retry record. maintenance_jobs
+      // holds them and is not exported; the importer writes them back so the
+      // gallery's next archive or delete removes the zips, and the expiry
+      // checker still retries.
+      archive_records: await require('./archiveService').exportArchiveRecords(),
+      file_count: files.length,
+      files: files.map(file => ({ path: file.relativePath, size: file.size,
+        checksum: file.checksum, object_metadata: file.objectMetadata })),
+      // NOTE: contains secrets (SMTP password, admin hashes, API keys) in plain
+      // text — the download surface must warn about this.
+      contains_secrets: true,
+    };
+    const manifestText = JSON.stringify(manifest, null, 2);
+    await fsp.writeFile(
+      path.join(staging, 'manifest.json'),
+      manifestText,
+      'utf8'
+    );
+    const warnings = importLimitWarnings({
+      entries: 1 + tables.length + files.length,
+      expandedBytes: Buffer.byteLength(manifestText) + tableBytes + files.reduce((total, file) => total + (Number(file.size) || 0), 0),
+      manifestBytes: Buffer.byteLength(manifestText),
+      largestRowBytes,
+    });
+    for (const warning of warnings) logger.warn(`[picpeak-export] this backup is larger than an importer accepts by default: ${warning}`);
+
+    // 4. Zip staging (manifest + data/) plus the blobs under files/. The final
+    //    .picpeak lands in outDir (caller-managed) or a fresh temp dir; either
+    //    way the NDJSON scratch (which holds plaintext secrets) is always
+    //    removed in `finally` below.
+    const targetDir = outDir || (await fsp.mkdtemp(path.join(os.tmpdir(), 'picpeak-out-')));
+    await fsp.mkdir(targetDir, { recursive: true });
+    const stamp = manifest.created_at.replace(/[:.]/g, '-');
+    const filePath = path.join(targetDir, `picpeak-backup-${stamp}.picpeak`);
+
+    try {
+      await new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(filePath);
+        const archive = archiver('zip', { zlib: { level: 9 } });
+        output.on('close', resolve);
+        output.on('error', reject);
+        archive.on('error', reject);
+        // Surface archiver warnings (e.g. a file vanished mid-run) instead of
+        // silently shipping an incomplete archive.
+        archive.on('warning', (err) => reject(err));
+        archive.pipe(output);
+        archive.file(path.join(staging, 'manifest.json'), { name: 'manifest.json' });
+        archive.directory(dataDir, 'data');
+        for (const f of files) {
+          archive.file(f.abs, { name: path.posix.join('files', f.rel.split(path.sep).join('/')) });
+        }
+        archive.finalize();
+      });
+    } catch (err) {
+      // Archiver failed → the partial .picpeak holds plaintext secrets and is
+      // useless; remove our own temp out dir so it isn't orphaned. A
+      // caller-supplied outDir is left untouched.
+      if (!outDir) await fsp.rm(targetDir, { recursive: true, force: true }).catch(() => {});
+      throw err;
+    }
+
+    logger.info(
+      `[picpeak-export] wrote ${filePath} (${tables.length} tables, ${files.length} files, includePhotos=${!!includePhotos})`
+    );
+    return { filePath, manifest, warnings };
+  } finally {
+    // Always remove the NDJSON scratch dir — it contains a plaintext dump of
+    // every table (secrets included). The final .picpeak is elsewhere.
+    await fsp.rm(staging, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+module.exports = {
+  importLimitWarnings,
+  PICPEAK_FORMAT_VERSION,
+  EXCLUDED_TABLES,
+  createPicpeak,
+  // exported for reuse/testing
+  listDataTables,
+  collectFiles,
+};

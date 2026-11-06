@@ -1,0 +1,107 @@
+/**
+ * Admin → Workflows → Approvals inbox. Lists workflow runs paused on a gate
+ * (e.g. "confirm there's no payment") and lets the admin confirm or deny,
+ * resuming the run down the matching edge. The same decision is also possible
+ * from the emailed confirm/deny link.
+ */
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
+import { Check, CheckSquare, X } from 'lucide-react';
+import { Button, Card, EmptyState, ErrorState, Loading } from '../../../components/common';
+import { SectionPageHeader } from '../../../components/admin/SectionPageHeader';
+import { workflowsService, type WorkflowApproval } from '../../../services/workflows.service';
+import { approvalEntityHref, approvalPrompt } from '../../../utils/workflowApprovals';
+import { useLocalizedDate } from '../../../hooks/useLocalizedDate';
+import { useMutationWithToast } from '../../../hooks';
+
+export const WorkflowApprovalsPage: React.FC = () => {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const { formatDateTime } = useLocalizedDate();
+
+  const { data: approvals, isLoading, isError, isRefetching, refetch } = useQuery({
+    queryKey: ['workflow-approvals'],
+    queryFn: () => workflowsService.approvals(),
+  });
+
+  const actMutation = useMutationWithToast({
+    mutationFn: ({ id, action }: { id: number; action: 'confirm' | 'deny' }) => workflowsService.actApproval(id, action),
+    successMessage: t('workflows.approvals.recorded', 'Response recorded') as string,
+    invalidateKeys: [['workflow-approvals']],
+    errorMessage: t('common.error', 'Something went wrong') as string,
+  });
+
+  const promptOf = (a: WorkflowApproval) => approvalPrompt(a) || t('workflows.approvals.defaultPrompt', 'A workflow needs your confirmation.');
+
+  return (
+    <div className="space-y-6">
+      <SectionPageHeader
+        icon={CheckSquare}
+        title={t('workflows.approvals.title', 'Approvals')}
+        description={t('workflows.approvals.subtitle', 'Workflow runs waiting on your confirmation.')}
+        feature="workflows"
+        className=""
+      />
+
+      <Card padding="none">
+        {isLoading ? (
+          <div className="p-10"><Loading /></div>
+        ) : isError && !approvals ? (
+          <ErrorState
+            size="inline"
+            title={t('workflows.approvals.loadFailed', 'Could not load the approvals')}
+            onRetry={() => refetch()}
+            retrying={isRefetching}
+          />
+        ) : !approvals || approvals.length === 0 ? (
+          <EmptyState
+            size="inline"
+            icon={<CheckSquare />}
+            title={t('workflows.approvals.empty', 'Nothing waiting for you right now.')}
+            description={t('workflows.approvals.emptyHint', 'A workflow with a confirmation gate lists its paused runs here.')}
+          />
+        ) : (
+          <ul className="divide-y divide-line">
+            {approvals.map((a) => {
+              const href = approvalEntityHref(a);
+              const meta = (
+                <>
+                  <div className="text-sm text-heading">{promptOf(a)}</div>
+                  <div className="text-xs text-muted mt-0.5">
+                    {a.workflow_name}
+                    {a.entity_type ? ` · ${a.entity_type} #${a.entity_id}` : ''}
+                    {a.created_at ? ` · ${formatDateTime(a.created_at)}` : ''}
+                  </div>
+                </>
+              );
+              return (
+                <li key={a.id} className="flex items-center gap-3 px-4 py-3">
+                  {href ? (
+                    <button
+                      type="button"
+                      onClick={() => navigate(href)}
+                      className="min-w-0 flex-1 text-left rounded -mx-1 px-1 py-0.5 hover:bg-hover-soft transition-colors cursor-pointer"
+                      title={t('workflows.approvals.openEntity', 'Open {{type}} #{{id}}', { type: a.entity_type, id: a.entity_id }) as string}
+                    >
+                      {meta}
+                    </button>
+                  ) : (
+                    <div className="min-w-0 flex-1">{meta}</div>
+                  )}
+                  <Button variant="outline" size="sm" isLoading={actMutation.isPending} onClick={() => actMutation.mutate({ id: a.id, action: 'confirm' })} leftIcon={<Check className="w-4 h-4" />}>
+                    {t('workflows.approvals.confirm', 'Confirm')}
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => actMutation.mutate({ id: a.id, action: 'deny' })} leftIcon={<X className="w-4 h-4" />}>
+                    {t('workflows.approvals.deny', 'Deny')}
+                  </Button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </Card>
+    </div>
+  );
+};

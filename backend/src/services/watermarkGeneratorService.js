@@ -1,0 +1,513 @@
+/**
+ * WatermarkGeneratorService
+ *
+ * Handles batch generation of pre-watermarked images for fast serving.
+ * This service is responsible for:
+ * - Generating watermarks for newly uploaded photos
+ * - Regenerating all watermarks when settings change
+ * - Tracking regeneration progress
+ */
+
+const pLimit = require('p-limit');
+const { db } = require('../database/db');
+const watermarkService = require('./watermarkService');
+const { resolvePhotoStorageKey, resolvePhotoFilePath } = require('./photoResolver');
+const { withLocalCopy, isRawFilename } = require('./imageProcessor');
+const logger = require('../utils/logger');
+const applicationWork = require('./activeApplicationWork');
+
+class WatermarkGeneratorService {
+  constructor() {
+    // Track active regeneration jobs
+    this.activeJobs = new Map();
+    // Batch size for processing (to manage memory)
+    this.batchSize = 10;
+    // Concurrent processing limit
+    this.concurrentLimit = 2;
+    // ONE process-wide limiter for every sharp pipeline this service
+    // spawns (#931). Per-invocation limiters would stack: overlapping
+    // regenerateAll/generateForEvent calls each brought their own cap,
+    // and the fire-and-forget generateForPhoto side-effect (one per
+    // uploaded photo) had no cap at all — a 363-photo bulk upload could
+    // decode 363 full-resolution images concurrently (#628 OOM class).
+    this.limit = pLimit(this.concurrentLimit);
+  }
+
+  /**
+   * Generate watermark for a single photo
+   * @param {number} photoId - The photo ID
+   * @returns {Object} Result with success status and watermark path
+   */
+  generateForPhoto(photoId) {
+    return applicationWork.track('photo watermark',
+      () => this.generateForPhotoInternal(photoId));
+  }
+
+  async generateForPhotoInternal(photoId) {
+    try {
+      // Get photo with event info
+      const photo = await db('photos')
+        .join('events', 'photos.event_id', 'events.id')
+        .where('photos.id', photoId)
+        .select(
+          'photos.*',
+          'events.slug',
+          'events.source_mode',
+          'events.external_path'
+        )
+        .first();
+
+      if (!photo) {
+        return { success: false, error: 'Photo not found' };
+      }
+
+      // Skip video files
+      if (photo.media_type === 'video' || (photo.mime_type && photo.mime_type.startsWith('video/'))) {
+        return { success: false, error: 'Videos do not support watermarks' };
+      }
+
+      // Skip RAW/DNG (experimental, #821). The watermark path opens the original
+      // with sharp, which can't decode RAW — proceeding would fall back to the
+      // original bytes and falsely record the copy as watermarked. Skipping keeps
+      // the watermark state honest until RAW watermarking is properly supported.
+      if (isRawFilename(photo.filename)) {
+        return { success: false, error: 'RAW/DNG files are not watermarked yet' };
+      }
+
+      // Get watermark settings
+      const settings = await watermarkService.getWatermarkSettings();
+      if (!settings || !settings.enabled) {
+        return { success: false, error: 'Watermarking is disabled' };
+      }
+
+      // Resolve the source via the storage backend (managed) or local disk
+      // (external reference mode). watermarkService needs a local file path.
+      const event = { slug: photo.slug, source_mode: photo.source_mode, external_path: photo.external_path };
+      const storageKey = resolvePhotoStorageKey(event, photo);
+      const result = await this.limit(async () => {
+        // Revalidate inside the limited slot: a long queue (bulk upload)
+        // can hold this job for minutes, during which an admin may disable
+        // watermarking — running with the captured settings would recreate
+        // files AFTER clearAllWatermarks() wiped them (#931 round 3).
+        const fresh = await watermarkService.getWatermarkSettings();
+        if (!fresh || !fresh.enabled) {
+          return { success: false, watermarkPath: null, error: 'Watermarking is disabled' };
+        }
+        // The gallery's own watermark text, read in the slot for the same
+        // reason: the admin may have changed it while this job queued.
+        const gallery = await db('events').where('id', photo.event_id).first('watermark_text');
+        const forGallery = watermarkService.forEvent(fresh, gallery);
+        return storageKey
+          ? withLocalCopy(storageKey, (lp) =>
+            watermarkService.generateAndSaveWatermark(photo, lp, forGallery)
+          )
+          : watermarkService.generateAndSaveWatermark(photo, resolvePhotoFilePath(event, photo), forGallery);
+      });
+
+      if (result.success) {
+        // Update database with watermark path
+        const attempt = require('./mediaAttemptContext').current();
+        if (!attempt) return this.recordWatermark(photo, result);
+        const { getStorage } = require('./storage');
+        await attempt.assertCurrent().catch(async (error) => {
+          await getStorage().delete(result.watermarkPath).catch(() => {});
+          throw error;
+        });
+        const written = await require('./mediaAttemptService').guard(attempt).update({
+          watermark_path: result.watermarkPath,
+          watermark_generated_at: db.fn.now()
+        });
+        // A lost claim removes its own file; a kept one, its predecessor's.
+        if (!written) await getStorage().delete(result.watermarkPath).catch(() => {});
+        else await require('./mediaAttemptService').dropSuperseded(getStorage(), photo.watermark_path, result.watermarkPath);
+      }
+
+      return result;
+    } catch (error) {
+      logger.error(`Error generating watermark for photo ${photoId}:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Record a watermark cut outside a media attempt, fenced on the file it was
+   * cut from: a job that read the photo before a replacement must not hand
+   * the new picture the old one's watermark. Its file is then nobody's.
+   */
+  async recordWatermark(photo, result) {
+    // An external file edited in place keeps its name: its version is what
+    // tells the old picture's watermark from the new one's.
+    const fence = { id: photo.id, filename: photo.filename };
+    if (photo.source_origin === 'external' || photo.source_origin === 'reference') {
+      for (const column of ['size_bytes', 'source_mtime_ms']) {
+        if (photo[column] !== undefined) fence[column] = photo[column];
+      }
+    }
+    // Set only over the path it read, so the file it displaces is known and
+    // dropped below: two cuts of one photo with different gallery texts have
+    // different keys, and the one overwritten must not stay behind unnamed.
+    let written = 0;
+    let displaced = null;
+    let current = null;
+    for (let tries = 0; tries < 5 && !written; tries += 1) {
+      current = await db('photos').where(fence).first('watermark_path');
+      if (!current) break;
+      displaced = current.watermark_path || null;
+      const update = displaced
+        ? db('photos').where(fence).where('watermark_path', displaced)
+        : db('photos').where(fence).whereNull('watermark_path');
+      written = await update.update({
+        watermark_path: result.watermarkPath,
+        watermark_generated_at: db.fn.now()
+      });
+    }
+    const unreferenced = async (key) => !(await db('photos').where({ watermark_path: key }).first('id'));
+    if (!written) {
+      if (await unreferenced(result.watermarkPath)) await watermarkService.deleteWatermarkFile(result.watermarkPath);
+      return {
+        success: false,
+        watermarkPath: null,
+        error: current ? 'Watermark kept changing while it was recorded' : 'Photo was replaced while its watermark was generated'
+      };
+    }
+    if (displaced && displaced !== result.watermarkPath && displaced !== photo.watermark_path
+        && await unreferenced(displaced)) {
+      await watermarkService.deleteWatermarkFile(displaced);
+    }
+    // Keys are per source file now; the previous name (the pre-source-key
+    // `<id>_watermarked.jpg`, or an attempt's) is dropped once nothing names
+    // it: a media attempt may have recorded it again since `photo` was read.
+    if (photo.watermark_path && photo.watermark_path !== result.watermarkPath
+        && await unreferenced(photo.watermark_path)) {
+      await watermarkService.deleteWatermarkFile(photo.watermark_path);
+    }
+    return result;
+  }
+
+  /**
+   * Generate watermarks for all photos in an event
+   * @param {number} eventId - The event ID
+   * @param {Function} onProgress - Optional callback for progress updates
+   * @returns {Object} Result with success count and errors
+   */
+  async generateForEvent(eventId, onProgress = null) {
+    const results = { total: 0, success: 0, failed: 0, errors: [] };
+
+    try {
+      // Get all photos for the event (excluding videos)
+      const photos = await db('photos')
+        .join('events', 'photos.event_id', 'events.id')
+        .where('photos.event_id', eventId)
+        .whereNot(function() {
+          this.where('photos.media_type', 'video')
+            .orWhere('photos.mime_type', 'like', 'video/%');
+        })
+        .select(
+          'photos.*',
+          'events.slug',
+          'events.source_mode',
+          'events.external_path'
+        );
+
+      results.total = photos.length;
+
+      if (photos.length === 0) {
+        return results;
+      }
+
+      // Get watermark settings once
+      const settings = await watermarkService.getWatermarkSettings();
+      if (!settings || !settings.enabled) {
+        return { ...results, errors: ['Watermarking is disabled'] };
+      }
+
+      // Process in batches. processPhotoWatermark routes every sharp
+      // pipeline through the shared instance limiter — a bare Promise.all
+      // over the batch ran all 10 at once, decoding 10 full-resolution
+      // images simultaneously (#931; same OOM class as #628 in the
+      // thumbnail path).
+      for (let i = 0; i < photos.length; i += this.batchSize) {
+        const batch = photos.slice(i, i + this.batchSize);
+
+        // Process batch with limited concurrency
+        const batchResults = await Promise.all(
+          batch.map(photo => this.processPhotoWatermark(photo, settings))
+        );
+
+        // Collect results
+        for (const result of batchResults) {
+          if (result.success) {
+            results.success++;
+          } else {
+            results.failed++;
+            if (result.error) {
+              results.errors.push(`Photo ${result.photoId}: ${result.error}`);
+            }
+          }
+        }
+
+        // Progress callback
+        if (onProgress) {
+          onProgress({
+            total: results.total,
+            processed: results.success + results.failed,
+            success: results.success,
+            failed: results.failed
+          });
+        }
+      }
+
+      return results;
+    } catch (error) {
+      logger.error(`Error generating watermarks for event ${eventId}:`, error);
+      return { ...results, errors: [...results.errors, error.message] };
+    }
+  }
+
+  /**
+   * Re-cut one gallery's stored watermarks after its watermark text changed.
+   * The old files are not served in the meantime (their key carries the old
+   * text, see watermarkService.storedWatermarkCurrent) and each is dropped
+   * once its replacement is recorded.
+   */
+  regenerateForEvent(eventId) {
+    return applicationWork.track('gallery watermark regeneration', () => this.generateForEvent(eventId));
+  }
+
+  /**
+   * Process watermark for a single photo (internal helper)
+   */
+  async processPhotoWatermark(photo, settings) {
+    try {
+      const event = { slug: photo.slug, source_mode: photo.source_mode, external_path: photo.external_path };
+      const storageKey = resolvePhotoStorageKey(event, photo);
+      const result = await this.limit(async () => {
+        // Same revalidation as generateForPhoto: batch jobs queue for a
+        // long time, and a disable mid-run must not recreate files after
+        // clearAllWatermarks(). The batch's `settings` snapshot is still
+        // used for rendering; only the enabled gate is rechecked.
+        const fresh = await watermarkService.getWatermarkSettings();
+        if (!fresh || !fresh.enabled) {
+          return { success: false, watermarkPath: null, error: 'Watermarking is disabled' };
+        }
+        // The gallery's text as of now, not as of the batch query: the admin
+        // may have changed it while this job queued.
+        const gallery = await db('events').where('id', photo.event_id).first('watermark_text');
+        const forGallery = watermarkService.forEvent(settings, gallery);
+        return storageKey
+          ? withLocalCopy(storageKey, (lp) =>
+            watermarkService.generateAndSaveWatermark(photo, lp, forGallery)
+          )
+          : watermarkService.generateAndSaveWatermark(photo, resolvePhotoFilePath(event, photo), forGallery);
+      });
+
+      return { ...(result.success ? await this.recordWatermark(photo, result) : result), photoId: photo.id };
+    } catch (error) {
+      return { success: false, photoId: photo.id, error: error.message };
+    }
+  }
+
+  /**
+   * Regenerate watermarks for all photos in the system
+   * @param {Function} onProgress - Optional callback for progress updates
+   * @returns {Object} Result with success count and errors
+   */
+  regenerateAll(onProgress = null) {
+    return applicationWork.track('watermark regeneration',
+      () => this.regenerateAllInternal(onProgress));
+  }
+
+  async regenerateAllInternal(onProgress = null) {
+    const jobId = Date.now().toString();
+    const results = { jobId, total: 0, success: 0, failed: 0, errors: [], status: 'running' };
+
+    try {
+      this.activeJobs.set(jobId, results);
+
+      // Get watermark settings
+      const settings = await watermarkService.getWatermarkSettings();
+      if (!settings || !settings.enabled) {
+        results.status = 'completed';
+        results.errors.push('Watermarking is disabled');
+        return results;
+      }
+
+      // First, clear existing watermarks from DB (the files will be overwritten)
+      // This ensures stale paths don't persist if regeneration fails
+
+      // Get all image photos (exclude videos)
+      const photos = await db('photos')
+        .join('events', 'photos.event_id', 'events.id')
+        .whereNot(function() {
+          this.where('photos.media_type', 'video')
+            .orWhere('photos.mime_type', 'like', 'video/%');
+        })
+        .select(
+          'photos.*',
+          'events.slug',
+          'events.source_mode',
+          'events.external_path'
+        );
+
+      results.total = photos.length;
+
+      if (photos.length === 0) {
+        results.status = 'completed';
+        return results;
+      }
+
+      logger.info(`Starting watermark regeneration for ${photos.length} photos`);
+
+      // Process in batches, capped at concurrentLimit parallel sharp
+      // pipelines via the shared instance limiter (see generateForEvent).
+      for (let i = 0; i < photos.length; i += this.batchSize) {
+        // Check if job was cancelled
+        if (!this.activeJobs.has(jobId)) {
+          results.status = 'cancelled';
+          return results;
+        }
+
+        const batch = photos.slice(i, i + this.batchSize);
+
+        // Process batch with limited concurrency
+        const batchResults = await Promise.all(
+          batch.map(photo => this.processPhotoWatermark(photo, settings))
+        );
+
+        // Collect results
+        for (const result of batchResults) {
+          if (result.success) {
+            results.success++;
+          } else {
+            results.failed++;
+            if (result.error && results.errors.length < 50) {
+              results.errors.push(`Photo ${result.photoId}: ${result.error}`);
+            }
+          }
+        }
+
+        // Update job status
+        this.activeJobs.set(jobId, { ...results });
+
+        // Progress callback
+        if (onProgress) {
+          onProgress({
+            jobId,
+            total: results.total,
+            processed: results.success + results.failed,
+            success: results.success,
+            failed: results.failed,
+            percentComplete: Math.round(((results.success + results.failed) / results.total) * 100)
+          });
+        }
+
+        // Small delay between batches to prevent CPU saturation
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
+      results.status = 'completed';
+      logger.info(`Watermark regeneration completed: ${results.success}/${results.total} successful`);
+
+      return results;
+    } catch (error) {
+      logger.error('Error during watermark regeneration:', error);
+      results.status = 'failed';
+      results.errors.push(error.message);
+      return results;
+    } finally {
+      // Clean up job tracking after a delay
+      setTimeout(() => {
+        this.activeJobs.delete(jobId);
+      }, 60000); // Keep for 1 minute for status queries
+    }
+  }
+
+  /**
+   * Clear all watermarks (when watermarking is disabled)
+   */
+  clearAllWatermarks() {
+    return applicationWork.track('watermark removal',
+      () => this.clearAllWatermarksInternal());
+  }
+
+  async clearAllWatermarksInternal() {
+    try {
+      // Get all photos with watermarks
+      const photos = await db('photos')
+        .whereNotNull('watermark_path')
+        .select('id', 'watermark_path');
+
+      // Delete watermark files
+      for (const photo of photos) {
+        await watermarkService.deleteWatermarkFile(photo.watermark_path);
+      }
+
+      // Clear database paths
+      await db('photos')
+        .whereNotNull('watermark_path')
+        .update({
+          watermark_path: null,
+          watermark_generated_at: null
+        });
+
+      logger.info(`Cleared ${photos.length} watermarks`);
+      return { success: true, cleared: photos.length };
+    } catch (error) {
+      logger.error('Error clearing watermarks:', error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  /**
+   * Get status of an active regeneration job
+   */
+  getJobStatus(jobId) {
+    return this.activeJobs.get(jobId) || null;
+  }
+
+  /**
+   * Cancel an active regeneration job
+   */
+  cancelJob(jobId) {
+    if (this.activeJobs.has(jobId)) {
+      this.activeJobs.delete(jobId);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Check if there's an active regeneration job
+   */
+  hasActiveJob() {
+    for (const [, job] of this.activeJobs) {
+      if (job.status === 'running') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Get count of photos needing watermark generation
+   */
+  async getPendingCount() {
+    const settings = await watermarkService.getWatermarkSettings();
+    if (!settings || !settings.enabled) {
+      return 0;
+    }
+
+    const result = await db('photos')
+      .whereNull('watermark_path')
+      .whereNot(function() {
+        this.where('media_type', 'video')
+          .orWhere('mime_type', 'like', 'video/%');
+      })
+      .count('id as count')
+      .first();
+
+    return parseInt(result.count) || 0;
+  }
+}
+
+module.exports = new WatermarkGeneratorService();

@@ -1,0 +1,511 @@
+import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import type { ReactNode } from 'react';
+import { useLocation } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
+import { api } from '../config/api';
+import { authService, galleryService } from '../services';
+import { cleanupOldGalleryAuth } from '../utils/cleanupGalleryAuth';
+import { normalizeRequirePassword } from '../utils/accessControl';
+import {
+  clearActiveGallerySlug,
+  clearGalleryToken,
+  setActiveGallerySlug,
+  storeGalleryToken,
+} from '../utils/galleryAuthStorage';
+import { clearGuestIdentity } from '../utils/guestIdentityStorage';
+import type { GalleryAccessLevel } from '../types';
+import { isShareToken } from '../utils/shareToken';
+import { isGalleryTemporarilyDisabled } from '../utils/galleryAvailability';
+
+interface GalleryEvent {
+  id: number;
+  event_name: string;
+  event_type: string;
+  event_date: string | null;
+  welcome_message?: string;
+  color_theme?: string;
+  expires_at: string | null;
+  require_password?: boolean;
+}
+
+const normalizeEvent = (incoming: GalleryEvent | null | undefined): GalleryEvent | null => {
+  if (!incoming) {
+    return null;
+  }
+
+  return {
+    ...incoming,
+    require_password: normalizeRequirePassword(incoming.require_password, true),
+  };
+};
+
+interface GalleryAuthContextType {
+  isAuthenticated: boolean;
+  event: GalleryEvent | null;
+  accessLevel: GalleryAccessLevel;
+  isClient: boolean;
+  /** Session was minted by the customer portal — credentialed, bypasses reveal. */
+  viaCustomer: boolean;
+  /** This session entered the client role from the regular gallery PIN form. */
+  viaClientPin: boolean;
+  login: (slug: string, password?: string, recaptchaToken?: string | null) => Promise<void>;
+  clientLogin: (slug: string, password: string, token: string) => Promise<void>;
+  enterClientMode: (slug: string, password: string) => Promise<void>;
+  leaveClientMode: (slug: string) => Promise<void>;
+  isSwitchingClientMode: boolean;
+  logout: () => void;
+  /**
+   * End a gallery session the server has rejected (expired, password
+   * changed). Unlike logout() it keeps the guest identity on this device.
+   */
+  endSession: () => void;
+  isLoading: boolean;
+  error: string | null;
+}
+
+const GalleryAuthContext = createContext<GalleryAuthContextType | undefined>(undefined);
+
+export const useGalleryAuth = () => {
+  const context = useContext(GalleryAuthContext);
+  if (!context) {
+    throw new Error('useGalleryAuth must be used within a GalleryAuthProvider');
+  }
+  return context;
+};
+
+interface GalleryAuthProviderProps {
+  children: ReactNode;
+}
+
+export const GalleryAuthProvider: React.FC<GalleryAuthProviderProps> = ({ children }) => {
+  const queryClient = useQueryClient();
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [event, setEvent] = useState<GalleryEvent | null>(null);
+  const [accessLevel, setAccessLevel] = useState<GalleryAccessLevel>('guest');
+  const [viaCustomer, setViaCustomer] = useState(false);
+  const [viaClientPin, setViaClientPin] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [isSwitchingClientMode, setIsSwitchingClientMode] = useState(false);
+  const switchingClientMode = useRef(false);
+  const [routeError, setRouteError] = useState<string | null>(null);
+  const location = useLocation();
+  const currentPath = useRef(location.pathname);
+  currentPath.current = location.pathname;
+  const [routeInfo, setRouteInfo] = useState<{ slug: string | null; token?: string; identifier: string | null; ready: boolean }>({
+    slug: null,
+    token: undefined,
+    identifier: null,
+    ready: false,
+  });
+  const lastResolvedIdentifier = useRef<string | null>(null);
+  // The pathname the latest route parse was for, and the pathname whose
+  // session probe has settled. Until they match the current location the
+  // context reports loading (see `isLoading` below).
+  const parsedPathRef = useRef<string | null>(null);
+  const [settledPath, setSettledPath] = useState<string | null>(null);
+
+  useEffect(() => {
+    cleanupOldGalleryAuth();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const parseRoute = async () => {
+      const segments = location.pathname.split('/').filter(Boolean);
+
+      if (segments[0] !== 'gallery') {
+        if (!cancelled) {
+          setRouteInfo({ slug: null, token: undefined, identifier: null, ready: true });
+          setRouteError(null);
+        }
+        return;
+      }
+
+      const identifier = segments[1] || null;
+      const tokenSegment = segments[2];
+
+      if (!identifier) {
+        if (!cancelled) {
+          setRouteInfo({ slug: null, token: undefined, identifier: null, ready: true });
+        }
+        return;
+      }
+
+      const looksLikeToken = isShareToken(identifier) && !tokenSegment;
+
+      if (looksLikeToken) {
+        if (lastResolvedIdentifier.current === identifier) {
+          setRouteInfo(prev => ({
+            slug: prev.slug,
+            token: prev.token,
+            identifier,
+            ready: true,
+          }));
+          setRouteError(null);
+          return;
+        }
+
+        try {
+          const resolved = await galleryService.resolveIdentifier(identifier);
+          if (cancelled) return;
+          lastResolvedIdentifier.current = identifier;
+          setRouteInfo({
+            slug: resolved.slug,
+            token: resolved.token,
+            identifier,
+            ready: true,
+          });
+          setRouteError(null);
+        } catch (err: any) {
+          if (cancelled) return;
+          lastResolvedIdentifier.current = identifier;
+          setRouteInfo({
+            slug: null,
+            token: undefined,
+            identifier,
+            ready: true,
+          });
+          setRouteError(err?.response?.data?.error || 'Unable to resolve gallery link');
+        }
+      } else {
+        lastResolvedIdentifier.current = null;
+        setRouteInfo({
+          slug: identifier,
+          token: tokenSegment,
+          identifier,
+          ready: true,
+        });
+        setRouteError(null);
+      }
+    };
+
+    parsedPathRef.current = location.pathname;
+    setRouteInfo(prev => ({ ...prev, ready: false }));
+    parseRoute();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!routeInfo.ready) {
+      return;
+    }
+    // A parse only reaches ready: true uncancelled, so this is its path.
+    const probedPath = parsedPathRef.current;
+
+    if (!routeInfo.slug) {
+      clearActiveGallerySlug();
+      setIsAuthenticated(false);
+      setEvent(null);
+      setIsLoading(false);
+      setSettledPath(probedPath);
+      return;
+    }
+
+    const currentSlug = routeInfo.slug;
+    setActiveGallerySlug(currentSlug);
+
+    const storedEvent = sessionStorage.getItem(`gallery_event_${currentSlug}`);
+    if (storedEvent) {
+      try {
+        const parsed = JSON.parse(storedEvent);
+        if (parsed && parsed.id) {
+          const normalizedStored = normalizeEvent(parsed);
+          setEvent(normalizedStored);
+          if (normalizedStored) {
+            sessionStorage.setItem(`gallery_event_${currentSlug}`, JSON.stringify(normalizedStored));
+          }
+        }
+      } catch {
+        sessionStorage.removeItem(`gallery_event_${currentSlug}`);
+      }
+    }
+
+    // Restore access level from session storage
+    const storedAccessLevel = sessionStorage.getItem(`gallery_access_level_${currentSlug}`);
+    if (storedAccessLevel === 'client') {
+      setAccessLevel('client');
+    } else {
+      setAccessLevel('guest');
+    }
+
+    const initialise = async () => {
+      try {
+        setIsLoading(true);
+        const sessionResponse = await api.get<{
+          valid: boolean; type: string; eventSlug?: string;
+          accessLevel?: GalleryAccessLevel; viaCustomer?: boolean; viaClientPin?: boolean; token?: string;
+        }>(
+          '/auth/session',
+          { params: { slug: currentSlug } }
+        );
+
+        if (sessionResponse.data?.valid && sessionResponse.data.type === 'gallery' && sessionResponse.data.eventSlug === currentSlug) {
+          // A session carried over from the gallery's old slug: replace any
+          // stale token kept for this slug, which would be sent as a Bearer
+          // and win over the cookie.
+          if (sessionResponse.data.token) {
+            storeGalleryToken(currentSlug, sessionResponse.data.token);
+          }
+          setIsAuthenticated(true);
+          // The SERVER's view of this session, not the per-tab sessionStorage
+          // guess above (#1149). A second tab has no sessionStorage but the
+          // same cookie, so the stored value silently downgraded a client
+          // session to 'guest' while the backend kept serving it as a client.
+          if (sessionResponse.data.accessLevel === 'client') {
+            setAccessLevel('client');
+            sessionStorage.setItem(`gallery_access_level_${currentSlug}`, 'client');
+          } else if (sessionResponse.data.accessLevel === 'guest') {
+            // And the other way: a dead client token replaced by a live
+            // guest session must not keep the client controls on screen.
+            setAccessLevel('guest');
+            sessionStorage.removeItem(`gallery_access_level_${currentSlug}`);
+          }
+          setViaCustomer(Boolean(sessionResponse.data.viaCustomer));
+          setViaClientPin(sessionResponse.data.accessLevel === 'client' && sessionResponse.data.viaClientPin === true);
+
+          // Always refresh from the server — the stored event from sessionStorage
+          // is shown above as an instant placeholder for perceived perf, but it
+          // must NOT win permanently: admin edits to welcome_message / event_name /
+          // hero_logo / colour theme need to land on the next page load for
+          // returning guests. sessionStorage survives Cmd+Shift+R, so without
+          // this refresh the cache could only be cleared by closing the tab or
+          // wiping site data manually (#625).
+          const galleryData = await galleryService.getGalleryPhotos(currentSlug);
+          if (galleryData?.event) {
+            const normalizedEvent = normalizeEvent(galleryData.event);
+            setEvent(normalizedEvent);
+            if (normalizedEvent) {
+              sessionStorage.setItem(`gallery_event_${currentSlug}`, JSON.stringify(normalizedEvent));
+            }
+          }
+
+          return;
+        }
+
+        if (routeInfo.token) {
+          const verify = await galleryService.verifyToken(currentSlug, routeInfo.token);
+          if (verify?.valid) {
+            // An admin preview does not take a guest session (#1386). The admin
+            // cookie plus admin_preview=1 already authorizes every gallery call,
+            // and shareLinkLogin refuses drafts AND records a failed attempt
+            // when it does — so opening a draft preview five times would lock
+            // share-link logins out for that IP, even after publishing.
+            const isAdminPreview = typeof window !== 'undefined'
+              && new URLSearchParams(window.location.search).get('admin_preview') === '1';
+            if (isAdminPreview) {
+              const previewData = await galleryService.getGalleryPhotos(currentSlug);
+              if (previewData?.event) {
+                const previewEvent = normalizeEvent(previewData.event);
+                setEvent(previewEvent);
+                setActiveGallerySlug(currentSlug);
+                setIsAuthenticated(true);
+                return;
+              }
+            }
+
+            const response = await authService.shareLinkLogin(currentSlug, routeInfo.token);
+            if (response?.event) {
+              // Store token and slug BEFORE setting authenticated state to avoid
+              // race condition where photo queries fire before token is available
+              if (response.token) {
+                storeGalleryToken(currentSlug, response.token);
+              }
+              setActiveGallerySlug(currentSlug);
+              const normalizedEvent = normalizeEvent(response.event);
+              setEvent(normalizedEvent);
+              if (normalizedEvent) {
+                sessionStorage.setItem(`gallery_event_${currentSlug}`, JSON.stringify(normalizedEvent));
+              }
+              setIsAuthenticated(true);
+              return;
+            }
+          }
+        }
+
+        setIsAuthenticated(false);
+        sessionStorage.removeItem(`gallery_event_${currentSlug}`);
+        setEvent(null);
+        clearGalleryToken(currentSlug);
+      } catch (initialiseError: any) {
+        setIsAuthenticated(false);
+        sessionStorage.removeItem(`gallery_event_${currentSlug}`);
+        setEvent(null);
+        // A pause withdraws access without revoking a still-valid session.
+        // The server will recheck it, including revocation, after re-enabling.
+        if (!isGalleryTemporarilyDisabled(initialiseError)) clearGalleryToken(currentSlug);
+        if (initialiseError?.response?.data?.error) {
+          setError(initialiseError.response.data.error);
+        }
+      } finally {
+        setIsLoading(false);
+        setSettledPath(probedPath);
+      }
+    };
+
+    initialise();
+
+    return () => {
+      clearActiveGallerySlug();
+    };
+  }, [routeInfo]);
+
+  const login = async (slug: string, password?: string, recaptchaToken?: string | null) => {
+    try {
+      setRouteError(null);
+      setError(null);
+      setIsLoading(true);
+      const response = await authService.verifyGalleryPassword(slug, password, recaptchaToken);
+      setViaClientPin(false);
+      setViaCustomer(false);
+      setAccessLevel('guest');
+      // Store token and slug BEFORE setting authenticated state to avoid
+      // race condition where photo queries fire before token is available
+      if (response.token) {
+        storeGalleryToken(slug, response.token);
+      }
+      setActiveGallerySlug(slug);
+      const normalizedEvent = normalizeEvent(response.event);
+      setEvent(normalizedEvent);
+      if (normalizedEvent) {
+        sessionStorage.setItem(`gallery_event_${slug}`, JSON.stringify(normalizedEvent));
+      }
+      setIsAuthenticated(true);
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'Invalid password');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const clientLoginFn = async (slug: string, password: string, token: string) => {
+    try {
+      setRouteError(null);
+      setError(null);
+      setIsLoading(true);
+      const response = await authService.clientLogin(slug, password, token);
+      setViaClientPin(false);
+      setViaCustomer(false);
+      if (response.token) {
+        storeGalleryToken(slug, response.token);
+      }
+      setActiveGallerySlug(slug);
+      const normalizedEvent = normalizeEvent(response.event);
+      setEvent(normalizedEvent);
+      if (normalizedEvent) {
+        sessionStorage.setItem(`gallery_event_${slug}`, JSON.stringify(normalizedEvent));
+      }
+      setAccessLevel(response.accessLevel || 'client');
+      sessionStorage.setItem(`gallery_access_level_${slug}`, 'client');
+      setIsAuthenticated(true);
+    } catch (err: any) {
+      setError(err.response?.data?.error || 'Invalid PIN');
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const changeClientMode = async (slug: string, password?: string) => {
+    if (switchingClientMode.current) return;
+    switchingClientMode.current = true;
+    setIsSwitchingClientMode(true);
+    try {
+      const pathAtStart = currentPath.current;
+      const response = password === undefined
+        ? await authService.leaveClientMode(slug)
+        : await authService.enterClientMode(slug, password);
+      // A response from a gallery the visitor has left must not replace the
+      // newly opened gallery's session or token.
+      if (currentPath.current !== pathAtStart) return;
+      // Cancellation stops a late client response from repopulating the guest
+      // cache. Both roles get a fresh view after a visibility-management visit.
+      const predicate = (query: { queryKey: readonly unknown[] }) => query.queryKey[1] === slug
+        && (String(query.queryKey[0]).startsWith('gallery-') || query.queryKey[0] === 'my-feedback');
+      await queryClient.cancelQueries({ predicate });
+      queryClient.removeQueries({ predicate });
+      storeGalleryToken(slug, response.token);
+      setActiveGallerySlug(slug);
+      const normalizedEvent = normalizeEvent(response.event);
+      setEvent(normalizedEvent);
+      sessionStorage.setItem(`gallery_event_${slug}`, JSON.stringify(normalizedEvent));
+      const nextLevel = response.accessLevel || 'guest';
+      setAccessLevel(nextLevel);
+      setViaCustomer(response.viaCustomer === true);
+      setViaClientPin(nextLevel === 'client' && response.viaClientPin === true);
+      if (nextLevel === 'client') sessionStorage.setItem(`gallery_access_level_${slug}`, 'client');
+      else sessionStorage.removeItem(`gallery_access_level_${slug}`);
+      setError(null);
+      setIsAuthenticated(true);
+    } finally {
+      switchingClientMode.current = false;
+      setIsSwitchingClientMode(false);
+    }
+  };
+
+  const closeSession = (keepGuestIdentity: boolean) => {
+    const currentSlug = routeInfo.slug;
+    if (currentSlug) {
+      sessionStorage.removeItem(`gallery_event_${currentSlug}`);
+      sessionStorage.removeItem(`gallery_access_level_${currentSlug}`);
+      clearGalleryToken(currentSlug);
+      // Logout is the "I am leaving this device" signal. Now that the guest
+      // identity outlives the tab (#1265), leaving it behind would greet the
+      // next person who enters the shared gallery password by this guest's
+      // name — with "forget me", which erases THIS guest's selections
+      // server-side, one click away. Local only; the server row is untouched.
+      //
+      // A session the server rejected is no such signal: the gallery token
+      // lasts 24h in sessionStorage, the identity 30 days in localStorage, and
+      // clearing it here left a returning guest unidentified, with their
+      // single-use invite already spent (issue 2209). Closing the tab keeps
+      // the identity too, so this is no weaker than that.
+      if (!keepGuestIdentity) clearGuestIdentity(currentSlug);
+    }
+    authService.galleryLogout(currentSlug || undefined);
+    setIsAuthenticated(false);
+    setEvent(null);
+    setAccessLevel('guest');
+    setViaCustomer(false);
+    setViaClientPin(false);
+    clearActiveGallerySlug();
+  };
+  const logout = () => closeSession(false);
+  const endSession = () => closeSession(true);
+
+  return (
+    <GalleryAuthContext.Provider
+      value={{
+        isAuthenticated,
+        event,
+        accessLevel,
+        isClient: accessLevel === 'client',
+        viaCustomer,
+        viaClientPin,
+        login,
+        clientLogin: clientLoginFn,
+        enterClientMode: (slug, password) => changeClientMode(slug, password),
+        leaveClientMode: (slug) => changeClientMode(slug),
+        isSwitchingClientMode,
+        logout,
+        endSession,
+        // Derived during render, not only set from an effect: on a move from
+        // one gallery to another, the first render of the new route still
+        // carries the old gallery's settled state, and GalleryPage's public
+        // auto-login effect runs before this provider's effects do (children
+        // first). Loading until the probe for this very path has settled
+        // keeps a guest login from overwriting a session the probe would
+        // have restored (fork survey A3).
+        isLoading: isLoading || settledPath !== location.pathname,
+        error: routeError ?? error,
+      }}
+    >
+      {children}
+    </GalleryAuthContext.Provider>
+  );
+};

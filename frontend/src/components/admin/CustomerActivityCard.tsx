@@ -1,0 +1,107 @@
+/**
+ * Admin → customer record → Activity (#1444).
+ *
+ * The customer's timeline — document uploads, shares, views, reviews and
+ * deletions, plus account and group changes — newest first, from the
+ * activity log. Labels come from admin.activities.<type>, the same keys the
+ * dashboard's recent activity uses, or admin.customerActivity.<type> where the
+ * shared label cannot lose its address; an unknown type still renders, as its
+ * key made readable.
+ */
+import React from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
+import { useInfiniteQuery } from '@tanstack/react-query';
+import { History } from 'lucide-react';
+
+import { Button, Card, EmptyState, ErrorState, Loading } from '../common';
+import { useLocalizedDate } from '../../hooks/useLocalizedDate';
+import { customerAdminService, type CustomerActivityEntry } from '../../services/customerAdmin.service';
+
+const readable = (type: string) => type.replace(/^customer_/, '').replace(/_/g, ' ');
+
+/**
+ * The shared labels name the customer ("Customer logged in: {{email}}"). On
+ * the customer's own record that is redundant, and the address is not sent:
+ * the empty tail is dropped. A label whose address does not trail a colon
+ * ("Password reset requested for customer {{email}}") would dangle, so those
+ * types have a card label phrased without it, admin.customerActivity.<type>.
+ */
+export function customerActivityLabel(t: TFunction, e: CustomerActivityEntry): string {
+  const text = (t([`admin.customerActivity.${e.type}`, `admin.activities.${e.type}`], {
+    defaultValue: readable(e.type),
+    ...e.metadata,
+    email: '',
+  }) as string).replace(/[\s:]+$/, '');
+  return e.metadata.documentId ? `${text} (#${e.metadata.documentId})` : text;
+}
+
+export const CustomerActivityCard: React.FC<{ customerId: number }> = ({ customerId }) => {
+  const { t } = useTranslation();
+  const { formatDateTime } = useLocalizedDate();
+  const {
+    data, isLoading, isError, isFetching, refetch, fetchNextPage, hasNextPage, isFetchingNextPage,
+  } = useInfiniteQuery({
+    queryKey: ['admin-customer-activity', customerId],
+    queryFn: ({ pageParam }) => customerAdminService.activity(customerId, pageParam),
+    initialPageParam: null as number | null,
+    getNextPageParam: (last) => last.nextBeforeId,
+  });
+
+  const entries: CustomerActivityEntry[] = data?.pages.flatMap((p) => p.entries) ?? [];
+
+  return (
+    <Card padding="lg">
+      <h2 className="text-lg font-semibold text-heading mb-1 flex items-center gap-2">
+        <History className="w-5 h-5" />
+        {t('customers.activity.title', 'Activity')}
+      </h2>
+      <p className="text-xs text-muted mb-4">
+        {t('customers.activity.hint', 'What happened on this customer\'s account and documents, newest first.')}
+      </p>
+      {isLoading ? <Loading /> : isError && !data ? (
+        <ErrorState
+          size="inline"
+          title={t('customers.activity.loadError', 'Could not load the activity.')}
+          onRetry={() => refetch()}
+          retrying={isFetching}
+        />
+      ) : entries.length === 0 ? (
+        <EmptyState size="inline" title={t('customers.activity.empty', 'No activity yet.')} />
+      ) : (
+        <>
+          <ol className="divide-y divide-line">
+            {entries.map((e) => (
+              <li key={e.id} className="py-2 flex items-start justify-between gap-3 flex-wrap">
+                <span className="text-sm text-heading min-w-0 break-words">
+                  {customerActivityLabel(t, e)}
+                  <span className="block text-xs text-muted">
+                    {e.actorType === 'customer'
+                      ? t('customers.activity.byCustomer', 'By the customer')
+                      : e.actorType === 'admin'
+                        ? t('customers.activity.byAdmin', 'By {{name}}', { name: e.actorName || t('customers.documents.anAdmin', 'an admin') })
+                        : t('customers.activity.bySystem', 'Automatic')}
+                  </span>
+                </span>
+                {e.at && (
+                  <time dateTime={e.at} className="text-xs text-muted whitespace-nowrap">
+                    {formatDateTime(e.at)}
+                  </time>
+                )}
+              </li>
+            ))}
+          </ol>
+          {hasNextPage && (
+            <div className="mt-3">
+              <Button type="button" variant="outline" size="sm" onClick={() => fetchNextPage()} isLoading={isFetchingNextPage}>
+                {t('customers.activity.more', 'Show older')}
+              </Button>
+            </div>
+          )}
+        </>
+      )}
+    </Card>
+  );
+};
+
+export default CustomerActivityCard;
